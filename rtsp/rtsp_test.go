@@ -1,0 +1,43 @@
+package rtsp_test
+
+import (
+	"testing"
+	"time"
+
+	"github.com/galaxy-iot/media-tool/rtsp"
+	"github.com/wh8199/log"
+)
+
+func TestNewClient(t *testing.T) {
+	c, err := rtsp.DialTimeout("rtsp://192.168.123.197/screenlive", 10*time.Second)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	defer c.Close()
+
+	if err := c.Options(); err != nil {
+		t.Error(err)
+		return
+	}
+
+	medias, err := c.Describe()
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	for _, media := range medias {
+		log.Info(media)
+	}
+
+	if err := c.SetupSingle(medias[0]); err != nil {
+		t.Error(err)
+		return
+	}
+
+	if err := c.Play(); err != nil {
+		t.Error(err)
+		return
+	}
+}
