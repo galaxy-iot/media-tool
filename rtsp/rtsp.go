@@ -190,9 +190,6 @@ func (c *Client) prepare(stage int) (err error) {
 				return
 			}
 		case stageDescribeDone:
-			if err = c.SetupAll(); err != nil {
-				return
-			}
 
 		case stageSetupDone:
 			if err = c.Play(); err != nil {
@@ -631,15 +628,7 @@ func (c *Client) ReadResponse() (res Response, err error) {
 	return
 }
 
-func (c *Client) SetupAll() (err error) {
-	idx := []int{}
-	for i := range c.streams {
-		idx = append(idx, i)
-	}
-	return c.Setup(idx)
-}
-
-func (c *Client) SetupSingle(m *sdp.Media) error {
+func (c *Client) Setup(m *sdp.Media) error {
 	uri := ""
 	control := m.Control
 	if strings.HasPrefix(control, "rtsp://") {
@@ -666,46 +655,6 @@ func (c *Client) SetupSingle(m *sdp.Media) error {
 	}
 
 	return nil
-}
-
-func (c *Client) Setup(idx []int) (err error) {
-	if err = c.prepare(stageDescribeDone); err != nil {
-		return
-	}
-
-	c.setupMap = make([]int, len(c.streams))
-	for i := range c.setupMap {
-		c.setupMap[i] = -1
-	}
-	c.setupIdx = idx
-
-	for i, si := range idx {
-		c.setupMap[si] = i
-
-		uri := ""
-		control := c.streams[si].Sdp.Control
-		if strings.HasPrefix(control, "rtsp://") {
-			uri = control
-		} else {
-			uri = c.requestUri + "/" + control
-		}
-		req := Request{Method: "SETUP", Uri: uri}
-		req.Header = append(req.Header, fmt.Sprintf("Transport: RTP/AVP/TCP;unicast;interleaved=%d-%d", si*2, si*2+1))
-		if c.session != "" {
-			req.Header = append(req.Header, "Session: "+c.session)
-		}
-		if err = c.WriteRequest(req); err != nil {
-			return
-		}
-		if _, err = c.ReadResponse(); err != nil {
-			return
-		}
-	}
-
-	if c.stage == stageDescribeDone {
-		c.stage = stageSetupDone
-	}
-	return
 }
 
 func md5hash(s string) string {
@@ -1211,14 +1160,14 @@ func (c *Client) Play() error {
 		}
 
 		payloadLen := int(binary.BigEndian.Uint16(header[2:]))
-		log.Info(header)
+		//log.Info(header)
 		payload := make([]byte, payloadLen)
 
 		if _, err := io.ReadFull(c.brconn, payload); err != nil {
 			return err
 		}
 
-		log.Info(payload)
+		//log.Info(payload)
 	}
 
 	return nil

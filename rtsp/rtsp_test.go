@@ -9,7 +9,7 @@ import (
 )
 
 func TestNewClient(t *testing.T) {
-	c, err := rtsp.DialTimeout("rtsp://192.168.123.197/screenlive", 10*time.Second)
+	c, err := rtsp.DialTimeout("rtsp://172.21.84.107/screenlive", 10*time.Second)
 	if err != nil {
 		t.Error(err)
 		return
@@ -31,7 +31,7 @@ func TestNewClient(t *testing.T) {
 		log.Info(media)
 	}
 
-	if err := c.SetupSingle(medias[0]); err != nil {
+	if err := c.Setup(medias[0]); err != nil {
 		t.Error(err)
 		return
 	}

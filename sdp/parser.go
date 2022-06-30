@@ -28,12 +28,14 @@ type Session struct {
 }
 
 type Media struct {
-	AVType             string
-	Type               av.CodecType
-	FPS                int
-	TimeScale          int
-	Control            string
-	Rtpmap             int
+	AVType    string
+	Type      av.CodecType
+	FPS       int
+	TimeScale int
+	Control   string
+	Rtpmap    int
+
+	SampleRate         int
 	ChannelCount       int
 	Config             []byte
 	SpropParameterSets [][]byte
@@ -87,8 +89,6 @@ func Parse(content string) (sess *Session, medias []*Media, err error) {
 		}
 
 		typeval := strings.SplitN(line, "=", 2)
-
-		//log.Info(line)
 
 		if len(typeval) != 2 {
 			return nil, nil, fmt.Errorf("invalid sdp line: %s", line)
@@ -173,29 +173,33 @@ func Parse(content string) (sess *Session, medias []*Media, err error) {
 				case "control":
 					media.Control = val
 				case "rtpmap":
-					//media.Rtpmap, err = strconv.Atoi(val)
-					//if err != nil {
-					//	continue
-					//}
+					vals := strings.SplitN(val, " ", 2)
 
+					if len(vals) == 1 {
+						continue
+					}
+
+					val = vals[1]
 					// TODO
 					keyval = strings.Split(val, "/")
 					if len(keyval) >= 2 {
+						log.Info(keyval)
 						key := keyval[0]
+						log.Info(key)
 						switch strings.ToUpper(key) {
-						case "MPEG4-GENERIC":
-							media.Type = av.AAC
 						case "L16":
 							media.Type = av.PCM
-						case "OPUS":
-							media.Type = av.OPUS
+						case "OPUS", "MPEG4-GENERIC", "H264":
+							media.ChannelCount = 1
+							if i, err := strconv.Atoi(keyval[1]); err == nil {
+								media.SampleRate = i
+							}
+
 							if len(keyval) > 2 {
 								if i, err := strconv.Atoi(keyval[2]); err == nil {
 									media.ChannelCount = i
 								}
 							}
-						case "H264":
-							media.Type = av.H264
 						case "JPEG":
 							media.Type = av.JPEG
 						case "H265":
