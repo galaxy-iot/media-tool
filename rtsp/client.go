@@ -16,73 +16,42 @@ import (
 	"strings"
 	"time"
 
-	"github.com/galaxy-iot/media-tool/av"
 	"github.com/galaxy-iot/media-tool/sdp"
 	"github.com/wh8199/log"
 )
 
-var (
-	DebugRtp        = false
-	DebugRtsp       = false
-	SkipErrRtpBlock = false
-)
-
-type Stream struct {
-	av.CodecData
-	Sdp    *sdp.Media
-	client *Client
-
-	// h264
-	fuStarted bool
-	fuBuffer  []byte
-	sps       []byte
-	pps       []byte
-
-	spsChanged bool
-	ppsChanged bool
-
-	gotpkt         bool
-	pkt            av.Packet
-	timestamp      uint32
-	firsttimestamp uint32
-
-	lasttime time.Duration
-}
+type Transport byte
 
 const (
-	stageOptionsDone = iota + 1
-	stageDescribeDone
-	stageSetupDone
-	stageWaitCodecData
-	stageCodecDataDone
+	UdpTransport          Transport = 1
+	TcpTransport          Transport = 2
+	UdpMulticastTransport Transport = 3
 )
 
+type Config struct {
+	URL       string
+	Transport Transport
+	Timeout   time.Duration
+}
+
 type Client struct {
+	Config
+
 	Headers []string
 
-	SkipErrRtpBlock bool
-
-	RtspTimeout         time.Duration
-	RtpTimeout          time.Duration
-	RtpKeepAliveTimeout time.Duration
-	rtpKeepaliveTimer   time.Time
-
-	stage int
-
-	setupIdx []int
-	setupMap []int
+	//RtspTimeout         time.Duration
+	//RtpTimeout          time.Duration
+	//RtpKeepAliveTimeout time.Duration
+	//rtpKeepaliveTimer   time.Time
 
 	authHeaders func(method string) []string
 
-	url         *url.URL
-	conn        *connWithTimeout
-	brconn      *bufio.Reader
-	requestUri  string
-	cseq        uint
-	streams     []*Stream
-	streamsintf []av.CodecData
-	session     string
-	body        io.Reader
+	url    *url.URL
+	conn   *connWithTimeout
+	brconn *bufio.Reader
+
+	cseq    uint
+	session string
 }
 
 type Request struct {
@@ -97,13 +66,12 @@ type Response struct {
 	Headers       textproto.MIMEHeader
 	ContentLength int
 	Body          []byte
-
-	Block []byte
+	Block         []byte
 }
 
-func DialTimeout(uri string, timeout time.Duration) (c *Client, err error) {
+func DialTimeout(cfg Config) (c *Client, err error) {
 	var URL *url.URL
-	if URL, err = url.Parse(uri); err != nil {
+	if URL, err = url.Parse(cfg.URL); err != nil {
 		return
 	}
 
@@ -111,7 +79,7 @@ func DialTimeout(uri string, timeout time.Duration) (c *Client, err error) {
 		URL.Host = URL.Host + ":554"
 	}
 
-	dailer := net.Dialer{Timeout: timeout}
+	dailer := net.Dialer{Timeout: cfg.Timeout}
 	var conn net.Conn
 	if conn, err = dailer.Dial("tcp", URL.Host); err != nil {
 		return
@@ -123,53 +91,20 @@ func DialTimeout(uri string, timeout time.Duration) (c *Client, err error) {
 	connt := &connWithTimeout{Conn: conn}
 
 	c = &Client{
-		conn:            connt,
-		brconn:          bufio.NewReaderSize(connt, 256),
-		url:             URL,
-		requestUri:      u2.String(),
-		SkipErrRtpBlock: SkipErrRtpBlock,
-	}
-	return
-}
-
-func Dial(uri string) (self *Client, err error) {
-	return DialTimeout(uri, 0)
-}
-
-func (c *Client) allCodecDataReady() bool {
-	for _, si := range c.setupIdx {
-		stream := c.streams[si]
-		if stream.CodecData == nil {
-			return false
-		}
-	}
-	return true
-}
-
-func (c *Client) SendRtpKeepalive() (err error) {
-	if c.RtpKeepAliveTimeout > 0 {
-		if c.rtpKeepaliveTimer.IsZero() {
-			c.rtpKeepaliveTimer = time.Now()
-		} else if time.Now().Sub(c.rtpKeepaliveTimer) > c.RtpKeepAliveTimeout {
-			c.rtpKeepaliveTimer = time.Now()
-
-			req := Request{
-				Method: "OPTIONS",
-				Uri:    c.requestUri,
-			}
-			if c.session != "" {
-				req.Header = append(req.Header, "Session: "+c.session)
-			}
-			if err = c.WriteRequest(req); err != nil {
-				return
-			}
-		}
+		conn:   connt,
+		brconn: bufio.NewReaderSize(connt, 256),
+		url:    URL,
+		Config: Config{
+			URL:       u2.String(),
+			Transport: cfg.Transport,
+			Timeout:   cfg.Timeout,
+		},
 	}
 	return
 }
 
 func (c *Client) WriteRequest(req Request) (err error) {
-	c.conn.Timeout = c.RtspTimeout
+	c.conn.Timeout = c.Timeout
 	c.cseq++
 
 	buf := &bytes.Buffer{}
@@ -265,11 +200,11 @@ func (c *Client) handle401(res *Response) (err error) {
 					}
 				} else {
 					hs1 := md5hash(username + ":" + realm + ":" + password)
-					hs2 := md5hash(method + ":" + c.requestUri)
+					hs2 := md5hash(method + ":" + c.URL)
 					response := md5hash(hs1 + ":" + nonce + ":" + hs2)
 					headers = []string{fmt.Sprintf(
 						`Authorization: Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s"`,
-						username, realm, nonce, c.requestUri, response)}
+						username, realm, nonce, c.URL, response)}
 				}
 				return headers
 			}
@@ -285,7 +220,7 @@ func (c *Client) Setup(m *sdp.Media) error {
 	if strings.HasPrefix(control, "rtsp://") {
 		uri = control
 	} else {
-		uri = c.requestUri + "/" + control
+		uri = c.URL + "/" + control
 	}
 
 	req := Request{Method: "SETUP", Uri: uri}
@@ -415,7 +350,7 @@ func md5hash(s string) string {
 func (c *Client) Describe() (streams []*sdp.Media, err error) {
 	req := Request{
 		Method: "DESCRIBE",
-		Uri:    c.requestUri,
+		Uri:    c.URL,
 		Header: []string{"Accept: application/sdp"},
 	}
 
@@ -448,7 +383,7 @@ func (c *Client) Describe() (streams []*sdp.Media, err error) {
 func (c *Client) Options() (err error) {
 	req := Request{
 		Method: "OPTIONS",
-		Uri:    c.requestUri,
+		Uri:    c.URL,
 	}
 
 	if c.session != "" {
@@ -463,23 +398,13 @@ func (c *Client) Options() (err error) {
 		return
 	}
 
-	c.stage = stageOptionsDone
 	return
-}
-
-func (c *Stream) timeScale() int {
-	t := c.Sdp.TimeScale
-	if t == 0 {
-		// https://tools.ietf.org/html/rfc5391
-		t = 8000
-	}
-	return t
 }
 
 func (c *Client) Play() error {
 	req := Request{
 		Method: "PLAY",
-		Uri:    c.requestUri,
+		Uri:    c.URL,
 	}
 
 	req.Header = append(req.Header, "Session: "+c.session)
@@ -506,14 +431,12 @@ func (c *Client) Play() error {
 
 		log.Info(payload)
 	}
-
-	return nil
 }
 
 func (c *Client) Teardown() (err error) {
 	req := Request{
 		Method: "TEARDOWN",
-		Uri:    c.requestUri,
+		Uri:    c.URL,
 	}
 
 	req.Header = append(req.Header, "Session: "+c.session)
