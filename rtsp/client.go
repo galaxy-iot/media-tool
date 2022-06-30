@@ -3,6 +3,7 @@ package rtsp
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/binary"
@@ -36,22 +37,19 @@ type Config struct {
 
 type Client struct {
 	Config
-
-	Headers []string
-
-	//RtspTimeout         time.Duration
-	//RtpTimeout          time.Duration
-	//RtpKeepAliveTimeout time.Duration
-	//rtpKeepaliveTimer   time.Time
-
+	Headers     []string
 	authHeaders func(method string) []string
+	url         *url.URL
+	conn        *connWithTimeout
+	brconn      *bufio.Reader
+	cseq        uint
+	session     string
 
-	url    *url.URL
-	conn   *connWithTimeout
-	brconn *bufio.Reader
+	ctx        context.Context
+	cancelFunc context.CancelFunc
 
-	cseq    uint
-	session string
+	rtpListener  *clientUDPListener
+	rtcpListener *clientUDPListener
 }
 
 type Request struct {
@@ -87,7 +85,6 @@ func DialTimeout(cfg Config) (c *Client, err error) {
 
 	u2 := *URL
 	u2.User = nil
-
 	connt := &connWithTimeout{Conn: conn}
 
 	c = &Client{
@@ -100,6 +97,8 @@ func DialTimeout(cfg Config) (c *Client, err error) {
 			Timeout:   cfg.Timeout,
 		},
 	}
+
+	c.ctx, c.cancelFunc = context.WithCancel(context.Background())
 	return
 }
 
@@ -224,21 +223,74 @@ func (c *Client) Setup(m *sdp.Media) error {
 	}
 
 	req := Request{Method: "SETUP", Uri: uri}
-	req.Header = append(req.Header, fmt.Sprintf("Transport: RTP/AVP/TCP;unicast;interleaved=%d-%d",
-		0, 1))
+
+	switch c.Transport {
+	case TcpTransport:
+		req.Header = append(req.Header, fmt.Sprintf("Transport: RTP/AVP/TCP;unicast;interleaved=%d-%d",
+			0, 1))
+	case UdpMulticastTransport:
+		c.rtpListener, c.rtcpListener = newClientUDPListenerPair(c, false)
+		req.Header = append(req.Header, fmt.Sprintf("Transport: RTP/AVP;multicast;client_port=%d-%d",
+			0, 1))
+	case UdpTransport:
+		c.rtpListener, c.rtcpListener = newClientUDPListenerPair(c, false)
+		req.Header = append(req.Header, fmt.Sprintf("Transport: RTP/AVP;unicast;client_port=%d-%d",
+			c.rtpListener.localPort, c.rtcpListener.localPort))
+	default:
+		return fmt.Errorf("unsupport transport")
+	}
+
 	if c.session != "" {
 		req.Header = append(req.Header, "Session: "+c.session)
 	}
 
 	if err := c.WriteRequest(req); err != nil {
-		log.Error(err)
 		return err
 	}
 
-	if _, err := c.ReadResponseOrInterleavedFrame(); err != nil {
-		log.Error(err)
+	resp, err := c.ReadResponse()
+	if err != nil {
 		return err
 	}
+
+	if c.Transport == TcpTransport {
+		return nil
+	}
+
+	transport := resp.Headers.Get("Transport")
+	if transport == "" {
+		return fmt.Errorf("header [Transport] not found")
+	}
+
+	index := strings.Index(transport, "server_port")
+	if index < 0 {
+		return fmt.Errorf("service port is not provided for header [Transport]")
+	}
+
+	transport = transport[index:]
+	index = strings.Index(transport, "=")
+	if index < 0 {
+		return fmt.Errorf("service port is not provided for header [Transport]")
+	}
+	transport = transport[index+1:]
+
+	ports := strings.Split(transport, "-")
+	if len(ports) < 2 {
+		return fmt.Errorf("service port is not provided for header [Transport]")
+	}
+
+	rtpPort, err := strconv.Atoi(ports[0])
+	if err != nil {
+		return fmt.Errorf("invalid server port")
+	}
+
+	rtcpPort, err := strconv.Atoi(ports[1])
+	if err != nil {
+		return fmt.Errorf("invalid server port")
+	}
+
+	c.rtpListener.setIP(c.conn, rtpPort)
+	c.rtcpListener.setIP(c.conn, rtcpPort)
 
 	return nil
 }
@@ -336,7 +388,19 @@ func (c *Client) ReadResponseOrInterleavedFrame() (interface{}, error) {
 	// $ channel length nalu
 	// 36 is $, so this is a inter leaved frame
 	if b == 36 {
-		return nil, nil
+		header := make([]byte, 4)
+		if _, err := io.ReadFull(c.brconn, header); err != nil {
+			return nil, err
+		}
+
+		payloadLen := int(binary.BigEndian.Uint16(header[2:]))
+		payload := make([]byte, payloadLen)
+
+		if _, err := io.ReadFull(c.brconn, payload); err != nil {
+			return nil, err
+		}
+
+		return payload, nil
 	}
 
 	return c.ReadResponse()
@@ -416,21 +480,70 @@ func (c *Client) Play() error {
 		return err
 	}
 
-	header := make([]byte, 4)
-	for {
-		if _, err := io.ReadFull(c.brconn, header); err != nil {
-			return err
+	go func() {
+		for {
+			select {
+			case <-c.ctx.Done():
+				return
+			default:
+				ret, err := c.ReadResponseOrInterleavedFrame()
+				if err != nil {
+					log.Error(err)
+				}
+
+				_ = ret
+				log.Info(ret)
+			}
 		}
+	}()
 
-		payloadLen := int(binary.BigEndian.Uint16(header[2:]))
-		payload := make([]byte, payloadLen)
-
-		if _, err := io.ReadFull(c.brconn, payload); err != nil {
-			return err
-		}
-
-		log.Info(payload)
+	if c.Transport == TcpTransport {
+		return nil
 	}
+
+	go func() {
+		if c.rtpListener != nil {
+			bytes := make([]byte, 2048)
+
+			for {
+				select {
+				case <-c.ctx.Done():
+					return
+				default:
+					n, _, err := c.rtpListener.pc.ReadFrom(bytes)
+					if err != nil {
+						log.Error(err)
+						continue
+					}
+
+					log.Info(bytes[:n])
+				}
+			}
+		}
+	}()
+
+	go func() {
+		if c.rtcpListener != nil {
+			bytes := make([]byte, 2048)
+
+			for {
+				select {
+				case <-c.ctx.Done():
+					return
+				default:
+					n, _, err := c.rtcpListener.pc.ReadFrom(bytes)
+					if err != nil {
+						log.Error(err)
+						continue
+					}
+
+					log.Info(bytes[:n])
+				}
+			}
+		}
+	}()
+
+	return nil
 }
 
 func (c *Client) Teardown() (err error) {

@@ -1,6 +1,7 @@
 package rtsp_test
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -10,8 +11,9 @@ import (
 
 func TestNewClient(t *testing.T) {
 	c, err := rtsp.DialTimeout(rtsp.Config{
-		URL:     "rtsp://172.21.84.107/screenlive",
-		Timeout: 10 * time.Second,
+		URL:       "rtsp://172.21.84.107/screenlive",
+		Timeout:   10 * time.Second,
+		Transport: rtsp.UdpTransport,
 	})
 	if err != nil {
 		t.Error(err)
@@ -43,4 +45,8 @@ func TestNewClient(t *testing.T) {
 		t.Error(err)
 		return
 	}
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	wg.Wait()
 }

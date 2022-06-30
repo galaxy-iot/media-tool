@@ -2,6 +2,12 @@ package rtsp
 
 import (
 	"crypto/rand"
+	"fmt"
+	"net"
+	"strconv"
+	"time"
+
+	"golang.org/x/net/ipv4"
 )
 
 func randUint32() uint32 {
@@ -14,42 +20,31 @@ func randIntn(n int) int {
 	return int(randUint32() & (uint32(n) - 1))
 }
 
-/*
 type clientUDPListener struct {
 	c     *Client
 	pc    *net.UDPConn
 	isRTP bool
 
+	writeTimeout time.Duration
+
+	localPort int
 	readIP    net.IP
 	readPort  int
 	writeAddr *net.UDPAddr
-
-	lastPacketTime *int64
-	readerDone     chan struct{}
 }
 
-func newClientUDPListenerPair(c *Client, ct *clientTrack) (*clientUDPListener, *clientUDPListener) {
+func newClientUDPListenerPair(c *Client, multiCast bool) (*clientUDPListener, *clientUDPListener) {
 	// choose two consecutive ports in range 65535-10000
 	// RTP port must be even and RTCP port odd
 	for {
 		rtpPort := (randIntn((65535-10000)/2) * 2) + 10000
-		rtpListener, err := newClientUDPListener(
-			c,
-			false,
-			":"+strconv.FormatInt(int64(rtpPort), 10),
-			ct,
-			true)
+		rtpListener, err := newClientUDPListener(c, rtpPort, multiCast, true)
 		if err != nil {
 			continue
 		}
 
 		rtcpPort := rtpPort + 1
-		rtcpListener, err := newClientUDPListener(
-			c,
-			false,
-			":"+strconv.FormatInt(int64(rtcpPort), 10),
-			ct,
-			false)
+		rtcpListener, err := newClientUDPListener(c, rtcpPort, multiCast, true)
 		if err != nil {
 			rtpListener.close()
 			continue
@@ -59,28 +54,28 @@ func newClientUDPListenerPair(c *Client, ct *clientTrack) (*clientUDPListener, *
 	}
 }
 
-func newClientUDPListener(
-	c *Client,
-	multicast bool,
-	address string,
-	ct *clientTrack,
-	isRTP bool,
-) (*clientUDPListener, error) {
-	var pc *net.UDPConn
+func listenPacket2Conn(listenPacket interface{}) (*net.UDPConn, error) {
+	c, ok := listenPacket.(*net.UDPConn)
+	if !ok {
+		return nil, fmt.Errorf("invalid listen packet")
+	}
+
+	return c, nil
+}
+
+func newClientUDPListener(c *Client, port int, multicast, isRTP bool) (*clientUDPListener, error) {
+	var (
+		pc *net.UDPConn
+	)
+
 	if multicast {
-		host, port, err := net.SplitHostPort(address)
+		conn, err := net.ListenPacket("udp", "224.0.0.0:"+strconv.Itoa(int(port)))
 		if err != nil {
-			return nil, err
+			fmt.Println(err)
 		}
 
-		tmp, err := c.ListenPacket("udp", "224.0.0.0:"+port)
-		if err != nil {
-			return nil, err
-		}
-
-		p := ipv4.NewPacketConn(tmp)
-
-		err = p.SetMulticastTTL(multicastTTL)
+		p := ipv4.NewPacketConn(conn)
+		err = p.SetMulticastTTL(100)
 		if err != nil {
 			return nil, err
 		}
@@ -91,140 +86,64 @@ func newClientUDPListener(
 		}
 
 		for _, intf := range intfs {
-			err := p.JoinGroup(&intf, &net.UDPAddr{IP: net.ParseIP(host)})
+			err := p.JoinGroup(&intf, &net.UDPAddr{IP: net.ParseIP("")})
 			if err != nil {
 				return nil, err
 			}
 		}
 
-		pc = tmp.(*net.UDPConn)
-	} else {
-		tmp, err := c.ListenPacket("udp", address)
+		pc, err = listenPacket2Conn(p)
 		if err != nil {
 			return nil, err
 		}
-		pc = tmp.(*net.UDPConn)
+	} else {
+		p, err := net.ListenPacket("udp", ":"+strconv.Itoa(int(port)))
+		if err != nil {
+			return nil, err
+		}
+
+		pc, err = listenPacket2Conn(p)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	err := pc.SetReadBuffer(udpKernelReadBufferSize)
-	if err != nil {
+	if err := pc.SetReadBuffer(0x80000); err != nil {
 		return nil, err
 	}
 
 	return &clientUDPListener{
-		c:     c,
-		pc:    pc,
-		ct:    ct,
-		isRTP: isRTP,
-		lastPacketTime: func() *int64 {
-			v := int64(0)
-			return &v
-		}(),
+		c:         c,
+		pc:        pc,
+		isRTP:     isRTP,
+		localPort: port,
 	}, nil
 }
 
 func (u *clientUDPListener) close() {
-	if u.running {
-		u.stop()
-	}
 	u.pc.Close()
 }
 
-func (u *clientUDPListener) port() int {
-	return u.pc.LocalAddr().(*net.UDPAddr).Port
-}
+func (u *clientUDPListener) setIP(c net.Conn, port int) {
+	u.readIP = c.RemoteAddr().(*net.TCPAddr).IP
 
-func (u *clientUDPListener) start(forPlay bool) {
-	u.running = true
-	u.pc.SetReadDeadline(time.Time{})
-	u.readerDone = make(chan struct{})
-	go u.runReader(forPlay)
-}
-
-func (u *clientUDPListener) stop() {
-	u.pc.SetReadDeadline(time.Now())
-	<-u.readerDone
-}
-
-func (u *clientUDPListener) runReader(forPlay bool) {
-	defer close(u.readerDone)
-
-	var processFunc func(time.Time, []byte)
-	if forPlay {
-		if u.isRTP {
-			processFunc = u.processPlayRTP
-		} else {
-			processFunc = u.processPlayRTCP
-		}
-	} else {
-		processFunc = u.processRecordRTCP
-	}
-
-	for {
-		buf := make([]byte, maxPacketSize)
-		n, addr, err := u.pc.ReadFrom(buf)
-		if err != nil {
-			return
-		}
-
-		uaddr := addr.(*net.UDPAddr)
-
-		if !u.readIP.Equal(uaddr.IP) || (!u.c.AnyPortEnable && u.readPort != uaddr.Port) {
-			continue
-		}
-
-		now := time.Now()
-		atomic.StoreInt64(u.lastPacketTime, now.Unix())
-
-		processFunc(now, buf[:n])
+	u.readPort = port
+	u.writeAddr = &net.UDPAddr{
+		IP:   u.readIP,
+		Zone: c.RemoteAddr().(*net.TCPAddr).Zone,
+		Port: port,
 	}
 }
 
-func (u *clientUDPListener) processPlayRTP(now time.Time, payload []byte) {
-	pkt := u.ct.udpRTPPacketBuffer.next()
-	err := pkt.Unmarshal(payload)
-	if err != nil {
-		return
-	}
-
-	out, err := u.ct.cleaner.Clear(pkt)
-	if err != nil {
-		return
-	}
-	out0 := out[0]
-
-	u.ct.udpRTCPReceiver.ProcessPacketRTP(time.Now(), pkt, out0.PTSEqualsDTS)
-
-	u.c.OnPacketRTP(&ClientOnPacketRTPCtx{
-		TrackID:      u.ct.id,
-		Packet:       out0.Packet,
-		PTSEqualsDTS: out0.PTSEqualsDTS,
-		H264NALUs:    out0.H264NALUs,
-		H264PTS:      out0.H264PTS,
-	})
-}
-
-func (u *clientUDPListener) processPlayRTCP(now time.Time, payload []byte) {
-	packets, err := rtcp.Unmarshal(payload)
-	if err != nil {
-		return
-	}
-
-	for _, pkt := range packets {
-		u.ct.udpRTCPReceiver.ProcessPacketRTCP(now, pkt)
-		u.c.OnPacketRTCP(&ClientOnPacketRTCPCtx{
-			TrackID: u.ct.id,
-			Packet:  pkt,
-		})
-	}
+func (u *clientUDPListener) getPort() int {
+	return u.localPort
 }
 
 func (u *clientUDPListener) write(payload []byte) error {
 	// no mutex is needed here since Write() has an internal lock.
 	// https://github.com/golang/go/issues/27203#issuecomment-534386117
 
-	u.pc.SetWriteDeadline(time.Now().Add(u.c.WriteTimeout))
+	u.pc.SetWriteDeadline(time.Now().Add(u.writeTimeout))
 	_, err := u.pc.WriteTo(payload, u.writeAddr)
 	return err
 }
-*/

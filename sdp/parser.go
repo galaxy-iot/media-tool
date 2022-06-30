@@ -183,9 +183,7 @@ func Parse(content string) (sess *Session, medias []*Media, err error) {
 					// TODO
 					keyval = strings.Split(val, "/")
 					if len(keyval) >= 2 {
-						log.Info(keyval)
 						key := keyval[0]
-						log.Info(key)
 						switch strings.ToUpper(key) {
 						case "L16":
 							media.Type = av.PCM
