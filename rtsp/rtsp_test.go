@@ -41,3 +41,28 @@ func TestNewClient(t *testing.T) {
 		return
 	}
 }
+
+func TestReadResponse(t *testing.T) {
+	c, err := rtsp.DialTimeout("rtsp://172.21.84.107/screenlive", 10*time.Second)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	defer c.Close()
+
+	req := rtsp.Request{
+		Method: "OPTIONS",
+		Uri:    "rtsp://172.21.84.107/screenlive",
+	}
+
+	if err = c.WriteRequest(req); err != nil {
+		return
+	}
+
+	resp, err := c.ReadResponse()
+	if err != nil {
+		return
+	}
+
+	t.Log(resp)
+}

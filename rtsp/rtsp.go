@@ -53,10 +53,11 @@ type Stream struct {
 	client *Client
 
 	// h264
-	fuStarted  bool
-	fuBuffer   []byte
-	sps        []byte
-	pps        []byte
+	fuStarted bool
+	fuBuffer  []byte
+	sps       []byte
+	pps       []byte
+
 	spsChanged bool
 	ppsChanged bool
 
@@ -113,6 +114,7 @@ type Request struct {
 
 type Response struct {
 	StatusCode    int
+	StatusMessage string
 	Headers       textproto.MIMEHeader
 	ContentLength int
 	Body          []byte
@@ -576,6 +578,7 @@ func (c *Client) readResp(b []byte) (res Response, err error) {
 			return
 		}
 	}
+
 	if err = c.handleResp(&res); err != nil {
 		return
 	}
@@ -616,18 +619,6 @@ func (c *Client) poll() (res Response, err error) {
 	return
 }
 
-func (c *Client) ReadResponse() (res Response, err error) {
-	for {
-		if res, err = c.poll(); err != nil {
-			return
-		}
-		if res.StatusCode > 0 {
-			return
-		}
-	}
-	return
-}
-
 func (c *Client) Setup(m *sdp.Media) error {
 	uri := ""
 	control := m.Control
@@ -649,12 +640,139 @@ func (c *Client) Setup(m *sdp.Media) error {
 		return err
 	}
 
-	if _, err := c.ReadResponse(); err != nil {
+	if _, err := c.ReadResponseOrInterleavedFrame(); err != nil {
 		log.Error(err)
 		return err
 	}
 
 	return nil
+}
+
+func readBytesLimited(rb *bufio.Reader, delim byte, n int) ([]byte, error) {
+	for i := 1; i <= n; i++ {
+		byts, err := rb.Peek(i)
+		if err != nil {
+			return nil, err
+		}
+
+		if byts[len(byts)-1] == delim {
+			rb.Discard(len(byts))
+			return byts, nil
+		}
+	}
+	return nil, fmt.Errorf("buffer length exceeds %d", n)
+}
+
+func readByteEqual(rb *bufio.Reader, cmp byte) error {
+	byt, err := rb.ReadByte()
+	if err != nil {
+		return err
+	}
+
+	if byt != cmp {
+		return fmt.Errorf("expected '%c', got '%c'", cmp, byt)
+	}
+
+	return nil
+}
+
+func (c *Client) ReadResponse() (*Response, error) {
+	res := Response{
+		Headers: make(textproto.MIMEHeader),
+	}
+
+	byts, err := readBytesLimited(c.brconn, ' ', 255)
+	if err != nil {
+		return nil, err
+	}
+	proto := byts[:len(byts)-1]
+
+	//rtspProtocol10           = "RTSP/1.0"
+	if string(proto) != "RTSP/1.0" {
+		return nil, fmt.Errorf("expected '%s', got %v", "RTSP/1.0", proto)
+	}
+
+	byts, err = readBytesLimited(c.brconn, ' ', 4)
+	if err != nil {
+		return nil, err
+	}
+	statusCodeStr := string(byts[:len(byts)-1])
+
+	statusCode64, err := strconv.Atoi(statusCodeStr)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse status code")
+	}
+	res.StatusCode = statusCode64
+
+	byts, err = readBytesLimited(c.brconn, '\r', 255)
+	if err != nil {
+		return nil, err
+	}
+
+	res.StatusMessage = string(byts[:len(byts)-1])
+	if len(res.StatusMessage) == 0 {
+		return nil, fmt.Errorf("empty status message")
+	}
+
+	err = readByteEqual(c.brconn, '\n')
+	if err != nil {
+		return nil, err
+	}
+
+	for {
+		line, err := c.brconn.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+
+		if line == "" || line == "\r\n" {
+			break
+		}
+
+		headerPair := strings.SplitN(line, ":", 2)
+		if len(headerPair) < 2 {
+			return nil, fmt.Errorf("invalid header: %s", line)
+		}
+
+		key := headerPair[0]
+		value := strings.TrimSpace(headerPair[1])
+
+		if "Content-Length" == key {
+			contentLength, err := strconv.Atoi(value)
+			if err != nil {
+				return nil, fmt.Errorf("invalid content length: %s", value)
+			}
+
+			res.ContentLength = contentLength
+		}
+
+		res.Headers.Add(key, value)
+	}
+
+	if res.ContentLength > 0 {
+		res.Body = make([]byte, res.ContentLength)
+		if _, err := io.ReadFull(c.brconn, res.Body); err != nil {
+			return nil, err
+		}
+	}
+
+	return &res, nil
+}
+
+func (c *Client) ReadResponseOrInterleavedFrame() (interface{}, error) {
+	b, err := c.brconn.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+	c.brconn.UnreadByte()
+
+	// $ channel length nalu
+	// 36 is $, so this is a inter leaved frame
+	if b == 36 {
+		return nil, nil
+	}
+
+	return c.ReadResponse()
 }
 
 func md5hash(s string) string {
@@ -693,18 +811,6 @@ func (c *Client) Describe() (streams []*sdp.Media, err error) {
 	}
 
 	return medias, nil
-
-	/*
-		c.streams = []*Stream{}
-		for _, media := range medias {
-			stream := &Stream{Sdp: media, client: c}
-			stream.makeCodecData()
-			c.streams = append(c.streams, stream)
-			streams = append(streams, stream)
-		}
-
-		c.stage = stageDescribeDone
-		return*/
 }
 
 func (c *Client) Options() (err error) {
@@ -775,86 +881,10 @@ func (c *Stream) timeScale() int {
 
 func (c *Stream) makeCodecData() (err error) {
 	return nil
-	/*
-		media := c.Sdp
-		if media.PayloadType >= 96 && media.PayloadType <= 127 {
-			switch media.Type {
-			case av.H264:
-				for _, nalu := range media.SpropParameterSets {
-					if len(nalu) > 0 {
-						c.handleH264Payload(0, nalu)
-					}
-				}
-
-				if len(c.sps) == 0 || len(c.pps) == 0 {
-					if nalus, typ := h264parser.SplitNALUs(media.Config); typ != h264parser.NALU_RAW {
-						for _, nalu := range nalus {
-							if len(nalu) > 0 {
-								c.handleH264Payload(0, nalu)
-							}
-						}
-					}
-				}
-
-				if len(c.sps) > 0 && len(c.pps) > 0 {
-					if c.CodecData, err = h264parser.NewCodecDataFromSPSAndPPS(c.sps, c.pps); err != nil {
-						err = fmt.Errorf("rtsp: h264 sps/pps invalid: %s", err)
-						return
-					}
-				} else {
-					err = fmt.Errorf("rtsp: missing h264 sps or pps")
-					return
-				}
-
-			case av.AAC:
-				if len(media.Config) == 0 {
-					err = fmt.Errorf("rtsp: aac sdp config missing")
-					return
-				}
-				if c.CodecData, err = aacparser.NewCodecDataFromMPEG4AudioConfigBytes(media.Config); err != nil {
-					err = fmt.Errorf("rtsp: aac sdp config invalid: %s", err)
-					return
-				}
-			case av.OPUS:
-				channelLayout := av.CH_MONO
-				if media.ChannelCount == 2 {
-					channelLayout = av.CH_STEREO
-				}
-
-				c.CodecData = codec.NewOpusCodecData(media.TimeScale, channelLayout)
-			default:
-				err = fmt.Errorf("rtsp: Type=%d unsupported", media.Type)
-				return
-			}
-		} else {
-			switch media.PayloadType {
-			case 0:
-				c.CodecData = codec.NewPCMMulawCodecData()
-			case 8:
-				c.CodecData = codec.NewPCMAlawCodecData()
-			default:
-				err = fmt.Errorf("rtsp: PayloadType=%d unsupported", media.PayloadType)
-				return
-			}
-		}
-		return*/
 }
 
 func (c *Stream) handleBuggyAnnexbH264Packet(timestamp uint32,
 	packet []byte) (isBuggy bool, err error) {
-	/*
-		if len(packet) >= 4 && packet[0] == 0 && packet[1] == 0 && packet[2] == 0 && packet[3] == 1 {
-		isBuggy = true
-		if nalus, typ := h264parser.SplitNALUs(packet); typ != h264parser.NALU_RAW {
-			for _, nalu := range nalus {
-				if len(nalu) > 0 {
-					if err = c.handleH264Payload(timestamp, nalu); err != nil {
-						return
-					}
-				}
-			}
-		}
-	}*/
 	return
 }
 
@@ -1160,14 +1190,13 @@ func (c *Client) Play() error {
 		}
 
 		payloadLen := int(binary.BigEndian.Uint16(header[2:]))
-		//log.Info(header)
 		payload := make([]byte, payloadLen)
 
 		if _, err := io.ReadFull(c.brconn, payload); err != nil {
 			return err
 		}
 
-		//log.Info(payload)
+		log.Info(payload)
 	}
 
 	return nil
