@@ -20,7 +20,7 @@ func randIntn(n int) int {
 	return int(randUint32() & (uint32(n) - 1))
 }
 
-type clientUDPListener struct {
+type rtpUDPClient struct {
 	c     *Client
 	pc    *net.UDPConn
 	isRTP bool
@@ -33,7 +33,7 @@ type clientUDPListener struct {
 	writeAddr *net.UDPAddr
 }
 
-func newClientUDPListenerPair(c *Client, multiCast bool) (*clientUDPListener, *clientUDPListener) {
+func newClientUDPListenerPair(c *Client, multiCast bool) (*rtpUDPClient, *rtpUDPClient) {
 	// choose two consecutive ports in range 65535-10000
 	// RTP port must be even and RTCP port odd
 	for {
@@ -63,7 +63,7 @@ func listenPacket2Conn(listenPacket interface{}) (*net.UDPConn, error) {
 	return c, nil
 }
 
-func newClientUDPListener(c *Client, port int, multicast, isRTP bool) (*clientUDPListener, error) {
+func newClientUDPListener(c *Client, port int, multicast, isRTP bool) (*rtpUDPClient, error) {
 	var (
 		pc *net.UDPConn
 	)
@@ -112,7 +112,7 @@ func newClientUDPListener(c *Client, port int, multicast, isRTP bool) (*clientUD
 		return nil, err
 	}
 
-	return &clientUDPListener{
+	return &rtpUDPClient{
 		c:         c,
 		pc:        pc,
 		isRTP:     isRTP,
@@ -120,11 +120,11 @@ func newClientUDPListener(c *Client, port int, multicast, isRTP bool) (*clientUD
 	}, nil
 }
 
-func (u *clientUDPListener) close() {
+func (u *rtpUDPClient) close() {
 	u.pc.Close()
 }
 
-func (u *clientUDPListener) setIP(c net.Conn, port int) {
+func (u *rtpUDPClient) setIP(c net.Conn, port int) {
 	u.readIP = c.RemoteAddr().(*net.TCPAddr).IP
 
 	u.readPort = port
@@ -135,11 +135,11 @@ func (u *clientUDPListener) setIP(c net.Conn, port int) {
 	}
 }
 
-func (u *clientUDPListener) getPort() int {
+func (u *rtpUDPClient) getPort() int {
 	return u.localPort
 }
 
-func (u *clientUDPListener) write(payload []byte) error {
+func (u *rtpUDPClient) write(payload []byte) error {
 	// no mutex is needed here since Write() has an internal lock.
 	// https://github.com/golang/go/issues/27203#issuecomment-534386117
 

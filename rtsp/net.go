@@ -26,19 +26,20 @@ func (c connWithTimeout) Write(p []byte) (n int, err error) {
 	return c.Conn.Write(p)
 }
 
-func readBytesLimited(rb *bufio.Reader, delim byte, n int) ([]byte, error) {
+func readBytesLimited(rb *bufio.Reader, delim byte, n int) ([]byte, int, error) {
 	for i := 1; i <= n; i++ {
 		byts, err := rb.Peek(i)
 		if err != nil {
-			return nil, err
+			return nil, -1, err
 		}
 
 		if byts[len(byts)-1] == delim {
 			rb.Discard(len(byts))
-			return byts, nil
+			return byts, i, nil
 		}
 	}
-	return nil, fmt.Errorf("buffer length exceeds %d", n)
+
+	return nil, -1, fmt.Errorf("buffer length exceeds %d", n)
 }
 
 func readByteEqual(rb *bufio.Reader, cmp byte) error {

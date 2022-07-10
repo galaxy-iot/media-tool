@@ -1,35 +1,31 @@
-package rtsp_test
+package main
 
 import (
 	"sync"
-	"testing"
 	"time"
 
 	"github.com/galaxy-iot/media-tool/rtsp"
 	"github.com/wh8199/log"
 )
 
-func TestNewClient(t *testing.T) {
+func main() {
 	c, err := rtsp.DialTimeout(rtsp.Config{
 		URL:       "rtsp://172.21.84.107/screenlive",
 		Timeout:   10 * time.Second,
 		Transport: rtsp.TcpTransport,
 	})
 	if err != nil {
-		t.Error(err)
-		return
+		log.Fatal(err)
 	}
 	defer c.Close()
 
 	if err := c.Options(); err != nil {
-		t.Error(err)
-		return
+		log.Fatal(err)
 	}
 
 	medias, err := c.Describe()
 	if err != nil {
-		t.Error(err)
-		return
+		log.Fatal(err)
 	}
 
 	for _, media := range medias {
@@ -37,13 +33,11 @@ func TestNewClient(t *testing.T) {
 	}
 
 	if err := c.Setup(medias[0]); err != nil {
-		t.Error(err)
-		return
+		log.Fatal(err)
 	}
 
 	if err := c.Play(); err != nil {
-		t.Error(err)
-		return
+		log.Fatal(err)
 	}
 
 	wg := sync.WaitGroup{}

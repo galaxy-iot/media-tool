@@ -48,23 +48,33 @@ type Client struct {
 	ctx        context.Context
 	cancelFunc context.CancelFunc
 
-	rtpListener  *clientUDPListener
-	rtcpListener *clientUDPListener
+	errChan chan struct{}
+
+	rtpListener  *rtpUDPClient
+	rtcpListener *rtpUDPClient
 }
 
 type Request struct {
-	Header []string
-	Uri    string
-	Method string
+	Header        []string
+	Uri           string
+	Method        string
+	Headers       textproto.MIMEHeader
+	Version       string
+	ContentLength int
+	Body          []byte
+	Cseq          int
+	SessionID     string
 }
 
 type Response struct {
+	Method        string
 	StatusCode    int
 	StatusMessage string
 	Headers       textproto.MIMEHeader
 	ContentLength int
 	Body          []byte
 	Block         []byte
+	Cseq          int
 }
 
 func DialTimeout(cfg Config) (c *Client, err error) {
@@ -123,10 +133,12 @@ func (c *Client) WriteRequest(req Request) (err error) {
 		io.WriteString(buf, s)
 		io.WriteString(buf, "\r\n")
 	}
+
 	for _, s := range c.Headers {
 		io.WriteString(buf, s)
 		io.WriteString(buf, "\r\n")
 	}
+
 	io.WriteString(buf, "\r\n")
 
 	bufout := buf.Bytes()
@@ -300,7 +312,7 @@ func (c *Client) ReadResponse() (*Response, error) {
 		Headers: make(textproto.MIMEHeader),
 	}
 
-	byts, err := readBytesLimited(c.brconn, ' ', 255)
+	byts, _, err := readBytesLimited(c.brconn, ' ', 255)
 	if err != nil {
 		return nil, err
 	}
@@ -311,7 +323,7 @@ func (c *Client) ReadResponse() (*Response, error) {
 		return nil, fmt.Errorf("expected '%s', got %v", "RTSP/1.0", proto)
 	}
 
-	byts, err = readBytesLimited(c.brconn, ' ', 4)
+	byts, _, err = readBytesLimited(c.brconn, ' ', 4)
 	if err != nil {
 		return nil, err
 	}
@@ -323,7 +335,7 @@ func (c *Client) ReadResponse() (*Response, error) {
 	}
 	res.StatusCode = statusCode64
 
-	byts, err = readBytesLimited(c.brconn, '\r', 255)
+	byts, _, err = readBytesLimited(c.brconn, '\r', 255)
 	if err != nil {
 		return nil, err
 	}
@@ -465,6 +477,17 @@ func (c *Client) Options() (err error) {
 	return
 }
 
+func (c *Client) ReConnectRoutine() {
+	for {
+		select {
+		case <-c.errChan:
+			return
+		default:
+
+		}
+	}
+}
+
 func (c *Client) Play() error {
 	req := Request{
 		Method: "PLAY",
@@ -492,7 +515,7 @@ func (c *Client) Play() error {
 				}
 
 				_ = ret
-				log.Info(ret)
+				//log.Info(ret)
 			}
 		}
 	}()
@@ -559,6 +582,25 @@ func (c *Client) Teardown() (err error) {
 	return
 }
 
-func (c *Client) Close() (err error) {
-	return c.conn.Conn.Close()
+func (c *Client) Close() {
+	if c.cancelFunc != nil {
+		c.cancelFunc()
+	}
+
+	if c.rtcpListener != nil {
+		c.rtcpListener.pc.Close()
+	}
+
+	if c.rtpListener != nil {
+		c.rtpListener.pc.Close()
+	}
+
+	if c.conn != nil && c.conn.Conn != nil {
+		c.conn.Conn.Close()
+	}
+}
+
+func (c *Client) Start() error {
+
+	return nil
 }

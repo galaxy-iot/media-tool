@@ -11,7 +11,7 @@ import (
 	"github.com/wh8199/log"
 )
 
-type Session struct {
+type SessionAttribute struct {
 	// u=<sessionUrl>
 	Uri string
 	// s=<sessionname>
@@ -70,9 +70,9 @@ k=prompt
 a=rtpmap:99 h263-1998/90000
 */
 
-func Parse(content string) (sess *Session, medias []*Media, err error) {
+func Parse(content string) (sess *SessionAttribute, medias []*Media, err error) {
 	var media *Media
-	sess = &Session{}
+	sess = &SessionAttribute{}
 
 	lines := strings.Split(content, "\n")
 
@@ -83,7 +83,7 @@ func Parse(content string) (sess *Session, medias []*Media, err error) {
 			continue
 		}
 
-		////Camera [BUG] a=x-framerate: 25
+		// Camera [BUG] a=x-framerate: 25
 		if strings.Contains(line, "x-framerate") {
 			line = strings.Replace(line, " ", "", -1)
 		}
