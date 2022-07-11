@@ -280,7 +280,7 @@ func (c *RTSPClientConnection) requestHandler(req *Request) (*Response, bool, er
 		c.medias = medias
 
 		resp := &Response{
-			Method:     MethodOption,
+			Method:     MethodAnnounce,
 			Cseq:       req.Cseq,
 			StatusCode: http.StatusOK,
 		}
@@ -288,7 +288,7 @@ func (c *RTSPClientConnection) requestHandler(req *Request) (*Response, bool, er
 		return resp, false, nil
 	case MethodSetup:
 		resp := &Response{
-			Method:     MethodOption,
+			Method:     MethodSetup,
 			Cseq:       req.Cseq,
 			StatusCode: http.StatusOK,
 			Headers:    textproto.MIMEHeader{},
@@ -312,13 +312,58 @@ func (c *RTSPClientConnection) requestHandler(req *Request) (*Response, bool, er
 		return resp, false, nil
 	case MethodRecord:
 		resp := &Response{
-			Method:     MethodOption,
+			Method:     MethodRecord,
 			Cseq:       req.Cseq,
 			StatusCode: http.StatusOK,
+			Headers:    textproto.MIMEHeader{},
 		}
 
-		for _, session := range c.clientSessions {
-			go session.Start()
+		trackID := getTrackID(c.Uri, req.Uri)
+
+		if trackID == "" {
+			for _, session := range c.clientSessions {
+				go session.Start()
+			}
+		} else {
+			c.clientSessionLock.Lock()
+			s := c.clientSessions[trackID]
+			c.clientSessionLock.Unlock()
+
+			if s == nil {
+				resp.StatusCode = http.StatusNotFound
+				return resp, false, nil
+			}
+
+			resp.Headers.Add("Session", s.GetSessionID())
+			go s.Start()
+		}
+
+		return resp, false, nil
+	case MethodPause:
+		resp := &Response{
+			Method:     MethodPause,
+			Cseq:       req.Cseq,
+			StatusCode: http.StatusOK,
+			Headers:    textproto.MIMEHeader{},
+		}
+
+		trackID := getTrackID(c.Uri, req.Uri)
+
+		if trackID == "" {
+			for _, session := range c.clientSessions {
+				go session.Stop()
+			}
+		} else {
+			c.clientSessionLock.Lock()
+			s := c.clientSessions[trackID]
+			c.clientSessionLock.Unlock()
+
+			if s == nil {
+				resp.StatusCode = http.StatusNotFound
+				return resp, false, nil
+			}
+			resp.Headers.Add("Session", s.GetSessionID())
+			go s.Stop()
 		}
 
 		return resp, false, nil
@@ -327,6 +372,7 @@ func (c *RTSPClientConnection) requestHandler(req *Request) (*Response, bool, er
 			Method:     MethodOption,
 			Cseq:       req.Cseq,
 			StatusCode: http.StatusOK,
+			Headers:    textproto.MIMEHeader{},
 		}
 		resp.Headers.Add("Session", req.SessionID)
 		return resp, true, nil

@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"fmt"
 	"net"
+	"strconv"
 	"time"
+
+	"github.com/galaxy-iot/media-tool/util"
 )
 
 type connWithTimeout struct {
@@ -53,4 +56,27 @@ func readByteEqual(rb *bufio.Reader, cmp byte) error {
 	}
 
 	return nil
+}
+
+func allocPortPair() (int, int) {
+	for {
+		rtpPort := (util.RandomIntn((65535-10000)/2) * 2) + 10000
+		rtcpPort := rtpPort + 1
+
+		p, err := net.ListenPacket("udp", ":"+strconv.Itoa(int(rtpPort)))
+		if err != nil {
+			continue
+		}
+
+		pp, err := net.ListenPacket("udp", ":"+strconv.Itoa(int(rtcpPort)))
+		if err != nil {
+			p.Close()
+			continue
+		}
+
+		p.Close()
+		pp.Close()
+
+		return rtpPort, rtcpPort
+	}
 }

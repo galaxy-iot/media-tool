@@ -15,9 +15,11 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/galaxy-iot/media-tool/sdp"
+	"github.com/galaxy-iot/media-tool/util"
 	"github.com/wh8199/log"
 )
 
@@ -37,25 +39,22 @@ type Config struct {
 
 type Client struct {
 	Config
-	Headers     []string
 	authHeaders func(method string) []string
 	url         *url.URL
 	conn        *connWithTimeout
 	brconn      *bufio.Reader
 	cseq        uint
 	session     string
+	medias      []*sdp.Media
 
 	ctx        context.Context
 	cancelFunc context.CancelFunc
 
-	errChan chan struct{}
-
-	rtpListener  *rtpUDPClient
-	rtcpListener *rtpUDPClient
+	sessions     map[string]Session
+	sessionsLock sync.RWMutex
 }
 
 type Request struct {
-	Header        []string
 	Uri           string
 	Method        string
 	Headers       textproto.MIMEHeader
@@ -75,6 +74,7 @@ type Response struct {
 	Body          []byte
 	Block         []byte
 	Cseq          int
+	SessionID     string
 }
 
 func DialTimeout(cfg Config) (c *Client, err error) {
@@ -106,6 +106,9 @@ func DialTimeout(cfg Config) (c *Client, err error) {
 			Transport: cfg.Transport,
 			Timeout:   cfg.Timeout,
 		},
+
+		sessions:     map[string]Session{},
+		sessionsLock: sync.RWMutex{},
 	}
 
 	c.ctx, c.cancelFunc = context.WithCancel(context.Background())
@@ -129,18 +132,14 @@ func (c *Client) WriteRequest(req Request) (err error) {
 		}
 	}
 
-	for _, s := range req.Header {
-		io.WriteString(buf, s)
-		io.WriteString(buf, "\r\n")
-	}
-
-	for _, s := range c.Headers {
-		io.WriteString(buf, s)
+	for key := range req.Headers {
+		io.WriteString(buf, key)
+		io.WriteString(buf, ": ")
+		io.WriteString(buf, req.Headers.Get(key))
 		io.WriteString(buf, "\r\n")
 	}
 
 	io.WriteString(buf, "\r\n")
-
 	bufout := buf.Bytes()
 
 	if _, err = c.conn.Write(bufout); err != nil {
@@ -225,7 +224,7 @@ func (c *Client) handle401(res *Response) (err error) {
 	return
 }
 
-func (c *Client) Setup(m *sdp.Media) error {
+func (c *Client) setup(m *sdp.Media) error {
 	uri := ""
 	control := m.Control
 	if strings.HasPrefix(control, "rtsp://") {
@@ -234,27 +233,30 @@ func (c *Client) Setup(m *sdp.Media) error {
 		uri = c.URL + "/" + control
 	}
 
-	req := Request{Method: "SETUP", Uri: uri}
+	req := Request{
+		Method:  "SETUP",
+		Uri:     uri,
+		Headers: textproto.MIMEHeader{},
+	}
+
+	transport := ""
 
 	switch c.Transport {
 	case TcpTransport:
-		req.Header = append(req.Header, fmt.Sprintf("Transport: RTP/AVP/TCP;unicast;interleaved=%d-%d",
-			0, 1))
+		transport = fmt.Sprintf("RTP/AVP/TCP;unicast;interleaved=%d-%d", 0, 1)
 	case UdpMulticastTransport:
-		c.rtpListener, c.rtcpListener = newClientUDPListenerPair(c, false)
-		req.Header = append(req.Header, fmt.Sprintf("Transport: RTP/AVP;multicast;client_port=%d-%d",
-			0, 1))
+		rtpPort, rtcpPort := allocPortPair()
+		transport = fmt.Sprintf("RTP/AVP;multicast;client_port=%d-%d",
+			rtpPort, rtcpPort)
 	case UdpTransport:
-		c.rtpListener, c.rtcpListener = newClientUDPListenerPair(c, false)
-		req.Header = append(req.Header, fmt.Sprintf("Transport: RTP/AVP;unicast;client_port=%d-%d",
-			c.rtpListener.localPort, c.rtcpListener.localPort))
+		rtpPort, rtcpPort := allocPortPair()
+		transport = fmt.Sprintf("RTP/AVP;unicast;client_port=%d-%d",
+			rtpPort, rtcpPort)
 	default:
 		return fmt.Errorf("unsupport transport")
 	}
 
-	if c.session != "" {
-		req.Header = append(req.Header, "Session: "+c.session)
-	}
+	req.Headers.Add("Transport", transport)
 
 	if err := c.WriteRequest(req); err != nil {
 		return err
@@ -265,44 +267,30 @@ func (c *Client) Setup(m *sdp.Media) error {
 		return err
 	}
 
-	if c.Transport == TcpTransport {
-		return nil
-	}
-
-	transport := resp.Headers.Get("Transport")
-	if transport == "" {
-		return fmt.Errorf("header [Transport] not found")
-	}
-
-	index := strings.Index(transport, "server_port")
-	if index < 0 {
-		return fmt.Errorf("service port is not provided for header [Transport]")
-	}
-
-	transport = transport[index:]
-	index = strings.Index(transport, "=")
-	if index < 0 {
-		return fmt.Errorf("service port is not provided for header [Transport]")
-	}
-	transport = transport[index+1:]
-
-	ports := strings.Split(transport, "-")
-	if len(ports) < 2 {
-		return fmt.Errorf("service port is not provided for header [Transport]")
-	}
-
-	rtpPort, err := strconv.Atoi(ports[0])
+	s, err := NewSession(control, resp.Headers.Get("Transport"), resp.SessionID, false)
 	if err != nil {
-		return fmt.Errorf("invalid server port")
+		return err
 	}
 
-	rtcpPort, err := strconv.Atoi(ports[1])
-	if err != nil {
-		return fmt.Errorf("invalid server port")
-	}
+	log.Info(s)
 
-	c.rtpListener.setIP(c.conn, rtpPort)
-	c.rtcpListener.setIP(c.conn, rtcpPort)
+	c.sessionsLock.Lock()
+	log.Info("lock")
+	c.sessions[control] = s
+	log.Info("unlock")
+	c.sessionsLock.Unlock()
+
+	log.Info(s)
+
+	return nil
+}
+
+func (c *Client) Setup(medias ...*sdp.Media) error {
+	for _, media := range medias {
+		if err := c.setup(media); err != nil {
+			return err
+		}
+	}
 
 	return nil
 }
@@ -377,6 +365,10 @@ func (c *Client) ReadResponse() (*Response, error) {
 			res.ContentLength = contentLength
 		}
 
+		if key == "Session" {
+			res.SessionID = value
+		}
+
 		res.Headers.Add(key, value)
 	}
 
@@ -397,7 +389,7 @@ func (c *Client) ReadResponseOrInterleavedFrame() (interface{}, error) {
 	}
 	c.brconn.UnreadByte()
 
-	// $ channel length nalu
+	// [$(1 byte) channel(1 byte) length(2 byte)] nalu
 	// 36 is $, so this is a inter leaved frame
 	if b == 36 {
 		header := make([]byte, 4)
@@ -425,17 +417,21 @@ func md5hash(s string) string {
 
 func (c *Client) Describe() (streams []*sdp.Media, err error) {
 	req := Request{
-		Method: "DESCRIBE",
-		Uri:    c.URL,
-		Header: []string{"Accept: application/sdp"},
+		Method:  "DESCRIBE",
+		Uri:     c.URL,
+		Headers: textproto.MIMEHeader{},
 	}
 
+	req.Headers.Add("Accept", "application/sdp")
+
 	if err = c.WriteRequest(req); err != nil {
+		log.Error(err)
 		return
 	}
 
 	res, err := c.ReadResponse()
 	if err != nil {
+		log.Error(err)
 		return
 	}
 
@@ -446,24 +442,25 @@ func (c *Client) Describe() (streams []*sdp.Media, err error) {
 
 	c.session = res.Headers.Get("Session")
 
-	body := string(res.Body)
-
-	_, medias, err := sdp.Parse(body)
+	_, medias, err := sdp.Parse(util.Bytes2String(res.Body))
 	if err != nil {
 		return nil, err
 	}
+
+	c.medias = medias
 
 	return medias, nil
 }
 
 func (c *Client) Options() (err error) {
 	req := Request{
-		Method: "OPTIONS",
-		Uri:    c.URL,
+		Method:  "OPTIONS",
+		Uri:     c.URL,
+		Headers: textproto.MIMEHeader{},
 	}
 
 	if c.session != "" {
-		req.Header = append(req.Header, "Session: "+c.session)
+		req.Headers.Add("Session", c.session)
 	}
 
 	if err = c.WriteRequest(req); err != nil {
@@ -477,24 +474,26 @@ func (c *Client) Options() (err error) {
 	return
 }
 
-func (c *Client) ReConnectRoutine() {
-	for {
-		select {
-		case <-c.errChan:
-			return
-		default:
+func (c *Client) Play(media *sdp.Media) error {
+	url := c.URL
 
-		}
+	if media != nil {
+		url = url + "/" + media.Control
 	}
-}
 
-func (c *Client) Play() error {
 	req := Request{
-		Method: "PLAY",
-		Uri:    c.URL,
+		Method:  "PLAY",
+		Uri:     url,
+		Headers: textproto.MIMEHeader{},
 	}
 
-	req.Header = append(req.Header, "Session: "+c.session)
+	if media != nil {
+		c.sessionsLock.Lock()
+		s := c.sessions[media.Control]
+		c.sessionsLock.Unlock()
+		req.Headers.Add("Session", s.GetSessionID())
+	}
+
 	if err := c.WriteRequest(req); err != nil {
 		return err
 	}
@@ -515,53 +514,7 @@ func (c *Client) Play() error {
 				}
 
 				_ = ret
-				//log.Info(ret)
-			}
-		}
-	}()
-
-	if c.Transport == TcpTransport {
-		return nil
-	}
-
-	go func() {
-		if c.rtpListener != nil {
-			bytes := make([]byte, 2048)
-
-			for {
-				select {
-				case <-c.ctx.Done():
-					return
-				default:
-					n, _, err := c.rtpListener.pc.ReadFrom(bytes)
-					if err != nil {
-						log.Error(err)
-						continue
-					}
-
-					log.Info(bytes[:n])
-				}
-			}
-		}
-	}()
-
-	go func() {
-		if c.rtcpListener != nil {
-			bytes := make([]byte, 2048)
-
-			for {
-				select {
-				case <-c.ctx.Done():
-					return
-				default:
-					n, _, err := c.rtcpListener.pc.ReadFrom(bytes)
-					if err != nil {
-						log.Error(err)
-						continue
-					}
-
-					log.Info(bytes[:n])
-				}
+				log.Info(ret)
 			}
 		}
 	}()
@@ -569,13 +522,19 @@ func (c *Client) Play() error {
 	return nil
 }
 
+func (c *Client) Pause(media *sdp.Media) error {
+
+	return nil
+}
+
 func (c *Client) Teardown() (err error) {
 	req := Request{
-		Method: "TEARDOWN",
-		Uri:    c.URL,
+		Method:  "TEARDOWN",
+		Uri:     c.URL,
+		Headers: textproto.MIMEHeader{},
 	}
 
-	req.Header = append(req.Header, "Session: "+c.session)
+	req.Headers.Add("Session", c.session)
 	if err = c.WriteRequest(req); err != nil {
 		return
 	}
@@ -587,13 +546,11 @@ func (c *Client) Close() {
 		c.cancelFunc()
 	}
 
-	if c.rtcpListener != nil {
-		c.rtcpListener.pc.Close()
+	c.sessionsLock.Lock()
+	for _, session := range c.sessions {
+		session.Stop()
 	}
-
-	if c.rtpListener != nil {
-		c.rtpListener.pc.Close()
-	}
+	c.sessionsLock.Unlock()
 
 	if c.conn != nil && c.conn.Conn != nil {
 		c.conn.Conn.Close()

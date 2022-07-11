@@ -40,10 +40,12 @@ type session struct {
 	TrackID string
 
 	// port configs
-	ClientDataPort         int
-	ClientControlPort      int
-	ServerDataPort         int
-	ServerControlPort      int
+	ClientRtpPort  int
+	ClientRtcpPort int
+
+	ServerRtpPort  int
+	ServerRtcpPort int
+
 	InterleavedDataPort    int
 	InterleavedControlPort int
 
@@ -55,8 +57,11 @@ type session struct {
 	RawTransport string
 	IsServer     bool
 
-	rtpConn  *net.UDPConn
-	rtcpConn *net.UDPConn
+	ClientRtpConn  *net.UDPConn
+	ClientRtcpConn *net.UDPConn
+
+	ServerRtpConn  *net.UDPConn
+	ServerRtcpConn *net.UDPConn
 
 	ctx      context.Context
 	cancFunc context.CancelFunc
@@ -68,19 +73,19 @@ func (s *session) String() string {
 	switch s.Transport {
 	case UdpTransport:
 		buf.WriteString("RTP/AVP;unicast;")
-		if s.ClientDataPort != 0 && s.ClientControlPort != 0 {
+		if s.ClientRtpPort != 0 && s.ClientRtcpPort != 0 {
 			buf.WriteString("client_port=")
-			buf.WriteString(strconv.Itoa(s.ClientDataPort))
+			buf.WriteString(strconv.Itoa(s.ClientRtpPort))
 			buf.WriteString("-")
-			buf.WriteString(strconv.Itoa(s.ClientControlPort))
+			buf.WriteString(strconv.Itoa(s.ClientRtcpPort))
 			buf.WriteString(";")
 		}
 
-		if s.ServerDataPort != 0 && s.ServerControlPort != 0 {
+		if s.ServerRtpPort != 0 && s.ServerRtcpPort != 0 {
 			buf.WriteString("server_port=")
-			buf.WriteString(strconv.Itoa(s.ServerDataPort))
+			buf.WriteString(strconv.Itoa(s.ServerRtpPort))
 			buf.WriteString("-")
-			buf.WriteString(strconv.Itoa(s.ServerControlPort))
+			buf.WriteString(strconv.Itoa(s.ServerRtcpPort))
 			buf.WriteString(";")
 		}
 
@@ -92,6 +97,7 @@ func (s *session) String() string {
 		}
 	case TcpTransport:
 		buf.WriteString("RTP/AVP/TCP;")
+
 		if s.InterleavedDataPort != 0 && s.InterleavedControlPort != 0 {
 			buf.WriteString("interleaved=")
 			buf.WriteString(strconv.Itoa(s.InterleavedDataPort))
@@ -154,29 +160,28 @@ func NewSession(trackID, trans, sess string, isServer bool) (Session, error) {
 	for _, item := range items {
 		item = strings.TrimSpace(item)
 
-		if item == "RTP/AVP" || item == "unicast" || item == "multicast" || item == "RTP/AVP/UDP" {
+		if item == "RTP/AVP" || item == "multicast" || item == "RTP/AVP/UDP" {
 			s.Transport = UdpTransport
 		} else if item == "RTP/AVP/TCP" {
 			s.Transport = TcpTransport
 		} else if strings.HasPrefix(item, "interleaved") {
 			interleaved := strings.TrimPrefix(item, "interleaved=")
 			var err error
-			s.InterleavedDataPort, s.InterleavedDataPort, err = convertPortPair(interleaved)
+			s.InterleavedDataPort, s.InterleavedControlPort, err = convertPortPair(interleaved)
 			if err != nil {
 				return nil, ErrInvalidInterleavedPort
 			}
-
 		} else if strings.HasPrefix(item, "client_port") {
 			clientPort := strings.TrimPrefix(item, "client_port=")
 			var err error
-			s.ClientDataPort, s.ClientControlPort, err = convertPortPair(clientPort)
+			s.ClientRtpPort, s.ClientRtcpPort, err = convertPortPair(clientPort)
 			if err != nil {
 				return nil, ErrInvalidClientPort
 			}
 		} else if strings.HasPrefix(item, "server_port") {
 			serverPort := strings.TrimPrefix(item, "server_port=")
 			var err error
-			s.ServerDataPort, s.ServerControlPort, err = convertPortPair(serverPort)
+			s.ServerRtpPort, s.ServerRtcpPort, err = convertPortPair(serverPort)
 			if err != nil {
 				return nil, ErrInvalidServerPort
 			}
@@ -186,22 +191,58 @@ func NewSession(trackID, trans, sess string, isServer bool) (Session, error) {
 		}
 	}
 
-	if s.Transport == UdpTransport || s.Transport == UdpMulticastTransport {
-		s.NewServerListenerPair()
+	if s.IsServer {
+		if err := s.NewServerListenerPair(); err != nil {
+			return nil, err
+		}
+
+		return s, nil
+	}
+
+	if s.Transport == UdpTransport {
+		if err := s.NewClientListernPair(); err != nil {
+			return nil, err
+		}
 	}
 
 	return s, nil
-}
-
-func (s *session) Read() ([]byte, error) {
-	return nil, nil
 }
 
 func (s *session) GetSessionID() string {
 	return s.SessionID
 }
 
-func newUDPConnection(port int) (*net.UDPConn, error) {
+func newUDPClient(port int) (*net.UDPConn, error) {
+	p, err := net.ListenPacket("udp", ":"+strconv.Itoa(int(port)))
+	if err != nil {
+		return nil, err
+	}
+
+	var listenPacket interface{} = p
+
+	c, ok := listenPacket.(*net.UDPConn)
+	if !ok {
+		return nil, fmt.Errorf("invalid listen packet")
+	}
+
+	return c, nil
+}
+
+func (s *session) NewClientListernPair() (err error) {
+	s.ClientRtpConn, err = newUDPClient(s.ClientRtpPort)
+	if err != nil {
+		return
+	}
+
+	s.ClientRtcpConn, err = newUDPClient(s.ClientRtcpPort)
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+func newUDPServerConnection(port int) (*net.UDPConn, error) {
 	rtpNet, err := net.ResolveUDPAddr("udp", ":"+strconv.Itoa(port))
 	if err != nil {
 		return nil, err
@@ -210,37 +251,37 @@ func newUDPConnection(port int) (*net.UDPConn, error) {
 	return net.ListenUDP("udp", rtpNet)
 }
 
-func (s *session) NewServerListenerPair() {
-	for {
-		rtpPort := (randIntn((65535-10000)/2) * 2) + 10000
+func (s *session) NewServerListenerPair() (err error) {
+	s.ServerRtpPort, s.ServerRtcpPort = allocPortPair()
 
-		rtpConn, err := newUDPConnection(rtpPort)
-		if err != nil {
-			continue
-		}
-
-		rtcpPort := rtpPort + 1
-		rtcpConn, err := newUDPConnection(rtcpPort)
-		if err != nil {
-			rtpConn.Close()
-			continue
-		}
-
-		s.rtpConn = rtpConn
-		s.ServerDataPort = rtpPort
-		s.ServerControlPort = rtcpPort
-		s.rtcpConn = rtcpConn
+	s.ClientRtpConn, err = newUDPServerConnection(s.ServerRtpPort)
+	if err != nil {
 		return
 	}
+
+	s.ClientRtcpConn, err = newUDPServerConnection(s.ServerRtcpPort)
+	if err != nil {
+		return
+	}
+
+	return
 }
 
 func (s *session) Stop() {
-	if s.rtpConn != nil {
-		s.rtpConn.Close()
+	if s.ClientRtpConn != nil {
+		s.ClientRtpConn.Close()
 	}
 
-	if s.rtcpConn != nil {
-		s.rtcpConn.Close()
+	if s.ClientRtcpConn != nil {
+		s.ClientRtcpConn.Close()
+	}
+
+	if s.ServerRtcpConn != nil {
+		s.ServerRtcpConn.Close()
+	}
+
+	if s.ServerRtpConn != nil {
+		s.ServerRtpConn.Close()
 	}
 
 	if s.cancFunc != nil {
@@ -250,7 +291,7 @@ func (s *session) Stop() {
 
 func (s *session) Start() error {
 	if s.IsServer && s.Transport == UdpTransport {
-		if s.rtpConn == nil || s.rtcpConn == nil {
+		if s.ClientRtpConn == nil || s.ClientRtcpConn == nil {
 			return fmt.Errorf("rtp connection or rtcp connection is empty")
 		}
 
@@ -261,7 +302,7 @@ func (s *session) Start() error {
 				case <-s.ctx.Done():
 					return
 				default:
-					if _, _, err := s.rtpConn.ReadFrom(bytes); err != nil {
+					if _, _, err := s.ClientRtpConn.ReadFrom(bytes); err != nil {
 						continue
 					}
 				}
@@ -275,7 +316,7 @@ func (s *session) Start() error {
 				case <-s.ctx.Done():
 					return
 				default:
-					if _, _, err := s.rtcpConn.ReadFrom(bytes); err != nil {
+					if _, _, err := s.ClientRtcpConn.ReadFrom(bytes); err != nil {
 						continue
 					}
 				}

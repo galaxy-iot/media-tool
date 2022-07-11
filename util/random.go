@@ -11,3 +11,7 @@ func Random32() uint32 {
 	random16Lower := r.Int31() & 0x00FFFF00
 	return uint32((random16Upper << 8) | (random16Lower >> 8))
 }
+
+func RandomIntn(n int) int {
+	return int(Random32() & (uint32(n) - 1))
+}

@@ -10,7 +10,7 @@ import (
 
 func main() {
 	c, err := rtsp.DialTimeout(rtsp.Config{
-		URL:       "rtsp://172.21.84.107/screenlive",
+		URL:       "rtsp://172.21.84.160/myapp/screenlive",
 		Timeout:   10 * time.Second,
 		Transport: rtsp.TcpTransport,
 	})
@@ -36,7 +36,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := c.Play(); err != nil {
+	if err := c.Play(nil); err != nil {
 		log.Fatal(err)
 	}
 
