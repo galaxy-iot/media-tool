@@ -4,10 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/md5"
-	"encoding/base64"
 	"encoding/binary"
-	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -21,6 +19,10 @@ import (
 	"github.com/galaxy-iot/media-tool/sdp"
 	"github.com/galaxy-iot/media-tool/util"
 	"github.com/wh8199/log"
+)
+
+var (
+	ErrUnsupportMethod = errors.New("unsupport method")
 )
 
 type Transport byte
@@ -39,19 +41,19 @@ type Config struct {
 
 type Client struct {
 	Config
-	authHeaders func(method string) []string
-	url         *url.URL
-	conn        *connWithTimeout
-	brconn      *bufio.Reader
-	cseq        uint
-	session     string
-	medias      []*sdp.Media
+	url    *url.URL
+	conn   *connWithTimeout
+	brconn *bufio.Reader
+	cseq   uint
+	//session string
+	medias []*sdp.Media
 
 	ctx        context.Context
 	cancelFunc context.CancelFunc
 
 	sessions     map[string]Session
 	sessionsLock sync.RWMutex
+	cseqs        []string
 }
 
 type Request struct {
@@ -112,6 +114,10 @@ func DialTimeout(cfg Config) (c *Client, err error) {
 	}
 
 	c.ctx, c.cancelFunc = context.WithCancel(context.Background())
+
+	go func() {
+
+	}()
 	return
 }
 
@@ -119,18 +125,12 @@ func (c *Client) WriteRequest(req Request) (err error) {
 	c.conn.Timeout = c.Timeout
 	c.cseq++
 
+	c.cseqs = append(c.cseqs, req.Method)
+
 	buf := &bytes.Buffer{}
 
 	fmt.Fprintf(buf, "%s %s RTSP/1.0\r\n", req.Method, req.Uri)
 	fmt.Fprintf(buf, "CSeq: %d\r\n", c.cseq)
-
-	if c.authHeaders != nil {
-		headers := c.authHeaders(req.Method)
-		for _, s := range headers {
-			io.WriteString(buf, s)
-			io.WriteString(buf, "\r\n")
-		}
-	}
 
 	for key := range req.Headers {
 		io.WriteString(buf, key)
@@ -144,81 +144,6 @@ func (c *Client) WriteRequest(req Request) (err error) {
 
 	if _, err = c.conn.Write(bufout); err != nil {
 		return
-	}
-
-	return
-}
-
-func (c *Client) handleResp(res *Response) (err error) {
-	if sess := res.Headers.Get("Session"); sess != "" && c.session == "" {
-		if fields := strings.Split(sess, ";"); len(fields) > 0 {
-			c.session = fields[0]
-		}
-	}
-
-	if res.StatusCode == 401 {
-		if err = c.handle401(res); err != nil {
-			return
-		}
-	}
-
-	return
-}
-
-func (c *Client) handle401(res *Response) (err error) {
-	/*
-		RTSP/1.0 401 Unauthorized
-		CSeq: 2
-		Date: Wed, May 04 2016 10:10:51 GMT
-		WWW-Authenticate: Digest realm="LIVE555 Streaming Media", nonce="c633aaf8b83127633cbe98fac1d20d87"
-	*/
-	authval := res.Headers.Get("WWW-Authenticate")
-	hdrval := strings.SplitN(authval, " ", 2)
-	var realm, nonce string
-
-	if len(hdrval) == 2 {
-		for _, field := range strings.Split(hdrval[1], ",") {
-			field = strings.Trim(field, ", ")
-			if keyval := strings.Split(field, "="); len(keyval) == 2 {
-				key := keyval[0]
-				val := strings.Trim(keyval[1], `"`)
-				switch key {
-				case "realm":
-					realm = val
-				case "nonce":
-					nonce = val
-				}
-			}
-		}
-
-		if realm != "" {
-			var username string
-			var password string
-
-			if c.url.User == nil {
-				err = fmt.Errorf("rtsp: no username")
-				return
-			}
-			username = c.url.User.Username()
-			password, _ = c.url.User.Password()
-
-			c.authHeaders = func(method string) []string {
-				var headers []string
-				if nonce == "" {
-					headers = []string{
-						fmt.Sprintf(`Authorization: Basic %s`, base64.StdEncoding.EncodeToString([]byte(username+":"+password))),
-					}
-				} else {
-					hs1 := md5hash(username + ":" + realm + ":" + password)
-					hs2 := md5hash(method + ":" + c.URL)
-					response := md5hash(hs1 + ":" + nonce + ":" + hs2)
-					headers = []string{fmt.Sprintf(
-						`Authorization: Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s"`,
-						username, realm, nonce, c.URL, response)}
-				}
-				return headers
-			}
-		}
 	}
 
 	return
@@ -267,22 +192,7 @@ func (c *Client) setup(m *sdp.Media) error {
 		return err
 	}
 
-	s, err := NewSession(control, resp.Headers.Get("Transport"), resp.SessionID, false)
-	if err != nil {
-		return err
-	}
-
-	log.Info(s)
-
-	c.sessionsLock.Lock()
-	log.Info("lock")
-	c.sessions[control] = s
-	log.Info("unlock")
-	c.sessionsLock.Unlock()
-
-	log.Info(s)
-
-	return nil
+	return c.OnSetupResponse(resp, control)
 }
 
 func (c *Client) Setup(medias ...*sdp.Media) error {
@@ -307,7 +217,7 @@ func (c *Client) ReadResponse() (*Response, error) {
 	proto := byts[:len(byts)-1]
 
 	//rtspProtocol10           = "RTSP/1.0"
-	if string(proto) != "RTSP/1.0" {
+	if util.Bytes2String(proto) != "RTSP/1.0" {
 		return nil, fmt.Errorf("expected '%s', got %v", "RTSP/1.0", proto)
 	}
 
@@ -356,7 +266,7 @@ func (c *Client) ReadResponse() (*Response, error) {
 		key := headerPair[0]
 		value := strings.TrimSpace(headerPair[1])
 
-		if key == "Content-Length" {
+		if strings.ToLower(key) == "content-length" {
 			contentLength, err := strconv.Atoi(value)
 			if err != nil {
 				return nil, fmt.Errorf("invalid content length: %s", value)
@@ -365,8 +275,17 @@ func (c *Client) ReadResponse() (*Response, error) {
 			res.ContentLength = contentLength
 		}
 
-		if key == "Session" {
+		if strings.ToLower(key) == "session" {
 			res.SessionID = value
+		}
+
+		if strings.ToLower(key) == "cseq" {
+			cseq, err := strconv.Atoi(value)
+			if err != nil {
+				return nil, fmt.Errorf("invalid cseq: %s", value)
+			}
+
+			res.Cseq = cseq
 		}
 
 		res.Headers.Add(key, value)
@@ -410,14 +329,9 @@ func (c *Client) ReadResponseOrInterleavedFrame() (interface{}, error) {
 	return c.ReadResponse()
 }
 
-func md5hash(s string) string {
-	h := md5.Sum([]byte(s))
-	return hex.EncodeToString(h[:])
-}
-
 func (c *Client) Describe() (streams []*sdp.Media, err error) {
 	req := Request{
-		Method:  "DESCRIBE",
+		Method:  MethodDescribe,
 		Uri:     c.URL,
 		Headers: textproto.MIMEHeader{},
 	}
@@ -435,43 +349,34 @@ func (c *Client) Describe() (streams []*sdp.Media, err error) {
 		return
 	}
 
-	if res.ContentLength == 0 || res.StatusCode != 200 {
-		err = fmt.Errorf("rtsp: Describe failed, StatusCode=%d", res.StatusCode)
-		return
-	}
-
-	c.session = res.Headers.Get("Session")
-
-	_, medias, err := sdp.Parse(util.Bytes2String(res.Body))
-	if err != nil {
+	if err := c.handlerResponse(res, ""); err != nil {
 		return nil, err
 	}
 
-	c.medias = medias
-
-	return medias, nil
+	return c.medias, nil
 }
 
-func (c *Client) Options() (err error) {
+func (c *Client) Options() error {
 	req := Request{
-		Method:  "OPTIONS",
+		Method:  MethodOption,
 		Uri:     c.URL,
 		Headers: textproto.MIMEHeader{},
 	}
 
-	if c.session != "" {
-		req.Headers.Add("Session", c.session)
+	//if c.session != "" {
+	//	req.Headers.Add("Session", c.session)
+	//}
+
+	if err := c.WriteRequest(req); err != nil {
+		return err
 	}
 
-	if err = c.WriteRequest(req); err != nil {
-		return
+	resp, err := c.ReadResponse()
+	if err != nil {
+		return err
 	}
 
-	if _, err = c.ReadResponse(); err != nil {
-		return
-	}
-
-	return
+	return c.handlerResponse(resp, "")
 }
 
 func (c *Client) Play(media *sdp.Media) error {
@@ -482,7 +387,7 @@ func (c *Client) Play(media *sdp.Media) error {
 	}
 
 	req := Request{
-		Method:  "PLAY",
+		Method:  MethodPlay,
 		Uri:     url,
 		Headers: textproto.MIMEHeader{},
 	}
@@ -498,32 +403,15 @@ func (c *Client) Play(media *sdp.Media) error {
 		return err
 	}
 
-	if _, err := c.ReadResponse(); err != nil {
+	resp, err := c.ReadResponse()
+	if err != nil {
 		return err
 	}
 
-	go func() {
-		for {
-			select {
-			case <-c.ctx.Done():
-				return
-			default:
-				ret, err := c.ReadResponseOrInterleavedFrame()
-				if err != nil {
-					log.Error(err)
-				}
-
-				_ = ret
-				log.Info(ret)
-			}
-		}
-	}()
-
-	return nil
+	return c.handlerResponse(resp, "")
 }
 
 func (c *Client) Pause(media *sdp.Media) error {
-
 	return nil
 }
 
@@ -534,7 +422,7 @@ func (c *Client) Teardown() (err error) {
 		Headers: textproto.MIMEHeader{},
 	}
 
-	req.Headers.Add("Session", c.session)
+	//req.Headers.Add("Session", c.session)
 	if err = c.WriteRequest(req); err != nil {
 		return
 	}
@@ -557,7 +445,96 @@ func (c *Client) Close() {
 	}
 }
 
+// response handlers
+func (c *Client) OnPlayResponse(resp *Response) error {
+	return nil
+}
+
+func (c *Client) OnOptionsReponse(resp *Response) error {
+	return nil
+}
+
+func (c *Client) OnDescribeResponse(resp *Response) error {
+	log.Info(resp.Headers)
+	log.Info(resp.ContentLength)
+	log.Info(resp.Body)
+
+	if resp.ContentLength == 0 || resp.StatusCode != 200 {
+		return fmt.Errorf("rtsp: Describe failed, StatusCode=%d", resp.StatusCode)
+	}
+
+	//c.session = resp.Headers.Get("Session")
+
+	_, medias, err := sdp.Parse(util.Bytes2String(resp.Body))
+	if err != nil {
+		return err
+	}
+
+	c.medias = medias
+
+	return nil
+}
+
+func (c *Client) OnSetupResponse(resp *Response, control string) error {
+	s, err := NewSession(control, resp.Headers.Get("Transport"), resp.SessionID, false)
+	if err != nil {
+		return err
+	}
+
+	c.sessionsLock.Lock()
+	c.sessions[control] = s
+	c.sessionsLock.Unlock()
+	return nil
+}
+
+func (c *Client) handlerResponse(resp *Response, control string) error {
+	resp.Method = c.cseqs[resp.Cseq-1]
+
+	switch resp.Method {
+	case MethodOption:
+		return c.OnOptionsReponse(resp)
+	case MethodDescribe:
+		return c.OnDescribeResponse(resp)
+	case MethodSetup:
+		return c.OnSetupResponse(resp, control)
+	case MethodPlay:
+		return c.OnPlayResponse(resp)
+	case MethodPause:
+		return nil
+	case MethodTeardown:
+		return nil
+	default:
+		log.Info(resp.Method)
+		return ErrUnsupportMethod
+	}
+}
+
 func (c *Client) Start() error {
+	go func() {
+		for {
+			select {
+			case <-c.ctx.Done():
+				return
+			default:
+				ret, err := c.ReadResponseOrInterleavedFrame()
+				if err != nil {
+					log.Error(err)
+				}
+
+				switch ret.(type) {
+				case *Response:
+					c.handlerResponse(ret.(*Response), "")
+				default:
+					p := ret.([]byte)
+					log.Info(p)
+				}
+			}
+		}
+	}()
+
+	for _, s := range c.sessions {
+		go s.Start()
+	}
 
 	return nil
 }

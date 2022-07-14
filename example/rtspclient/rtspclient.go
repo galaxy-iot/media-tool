@@ -10,7 +10,7 @@ import (
 
 func main() {
 	c, err := rtsp.DialTimeout(rtsp.Config{
-		URL:       "rtsp://172.21.84.160/myapp/screenlive",
+		URL:       "rtsp://192.168.123.197/myapp/screenlive",
 		Timeout:   10 * time.Second,
 		Transport: rtsp.TcpTransport,
 	})
@@ -39,6 +39,8 @@ func main() {
 	if err := c.Play(nil); err != nil {
 		log.Fatal(err)
 	}
+
+	c.Start()
 
 	wg := sync.WaitGroup{}
 	wg.Add(1)
