@@ -16,6 +16,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/galaxy-iot/media-tool/av"
+	"github.com/galaxy-iot/media-tool/rtp"
 	"github.com/galaxy-iot/media-tool/sdp"
 	"github.com/galaxy-iot/media-tool/util"
 	"github.com/wh8199/log"
@@ -23,6 +25,7 @@ import (
 
 var (
 	ErrUnsupportMethod = errors.New("unsupport method")
+	ErrInvalidControl  = errors.New("invalid control id")
 )
 
 type Transport byte
@@ -33,10 +36,30 @@ const (
 	UdpMulticastTransport Transport = 3
 )
 
+type Mode byte
+
+const (
+	ModePlay   Mode = 1
+	ModeRecord Mode = 2
+)
+
+func (m Mode) String() string {
+	switch m {
+	case ModePlay:
+		return "play"
+	case ModeRecord:
+		return "record"
+	default:
+		return ""
+	}
+}
+
 type Config struct {
-	URL       string
-	Transport Transport
-	Timeout   time.Duration
+	URL        string
+	Transport  Transport
+	Timeout    time.Duration
+	Verb       bool
+	OnAVPacket func(avPacket *av.AVPacket) error
 }
 
 type Client struct {
@@ -45,7 +68,6 @@ type Client struct {
 	conn   *connWithTimeout
 	brconn *bufio.Reader
 	cseq   uint
-	//session string
 	medias []*sdp.Media
 
 	ctx        context.Context
@@ -54,6 +76,11 @@ type Client struct {
 	sessions     map[string]Session
 	sessionsLock sync.RWMutex
 	cseqs        []string
+
+	disConnectChan chan struct{}
+	// current controls
+	// used for reconnecting
+	currentControls []string
 }
 
 type Request struct {
@@ -79,45 +106,51 @@ type Response struct {
 	SessionID     string
 }
 
-func DialTimeout(cfg Config) (c *Client, err error) {
-	var URL *url.URL
-	if URL, err = url.Parse(cfg.URL); err != nil {
-		return
+type RTPResponse struct {
+	ControlID string `json:"controlId"`
+	Payload   []byte `json:"payload"`
+}
+
+func dial(cfg Config) (*connWithTimeout, *url.URL, error) {
+	parsedUrl, err := url.Parse(cfg.URL)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	if _, _, err := net.SplitHostPort(URL.Host); err != nil {
-		URL.Host = URL.Host + ":554"
+	if _, _, err := net.SplitHostPort(parsedUrl.Host); err != nil {
+		parsedUrl.Host = parsedUrl.Host + ":554"
 	}
 
 	dailer := net.Dialer{Timeout: cfg.Timeout}
-	var conn net.Conn
-	if conn, err = dailer.Dial("tcp", URL.Host); err != nil {
-		return
+	conn, err := dailer.Dial("tcp", parsedUrl.Host)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	u2 := *URL
-	u2.User = nil
-	connt := &connWithTimeout{Conn: conn}
+	parsedUrl.User = nil
+	return &connWithTimeout{Conn: conn}, parsedUrl, nil
+}
+
+func DialTimeout(cfg Config) (c *Client, err error) {
+	connt, parsedUrl, err := dial(cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	c = &Client{
 		conn:   connt,
 		brconn: bufio.NewReaderSize(connt, 256),
-		url:    URL,
-		Config: Config{
-			URL:       u2.String(),
-			Transport: cfg.Transport,
-			Timeout:   cfg.Timeout,
-		},
+		url:    parsedUrl,
+		Config: cfg,
 
 		sessions:     map[string]Session{},
 		sessionsLock: sync.RWMutex{},
+
+		disConnectChan:  make(chan struct{}),
+		currentControls: []string{},
 	}
 
 	c.ctx, c.cancelFunc = context.WithCancel(context.Background())
-
-	go func() {
-
-	}()
 	return
 }
 
@@ -149,9 +182,8 @@ func (c *Client) WriteRequest(req Request) (err error) {
 	return
 }
 
-func (c *Client) setup(m *sdp.Media) error {
+func (c *Client) setup(control string) error {
 	uri := ""
-	control := m.Control
 	if strings.HasPrefix(control, "rtsp://") {
 		uri = control
 	} else {
@@ -195,9 +227,9 @@ func (c *Client) setup(m *sdp.Media) error {
 	return c.OnSetupResponse(resp, control)
 }
 
-func (c *Client) Setup(medias ...*sdp.Media) error {
-	for _, media := range medias {
-		if err := c.setup(media); err != nil {
+func (c *Client) Setup(controls ...string) error {
+	for _, control := range controls {
+		if err := c.setup(control); err != nil {
 			return err
 		}
 	}
@@ -316,6 +348,19 @@ func (c *Client) ReadResponseOrInterleavedFrame() (interface{}, error) {
 			return nil, err
 		}
 
+		controlID := ""
+		for c, s := range c.sessions {
+			p1, p2 := s.GetInterleavedPort()
+			if p1 == int(header[1]) || p2 == int(header[1]) {
+				controlID = c
+				break
+			}
+		}
+
+		if controlID == "" {
+			return nil, ErrInvalidControl
+		}
+
 		payloadLen := int(binary.BigEndian.Uint16(header[2:]))
 		payload := make([]byte, payloadLen)
 
@@ -323,7 +368,10 @@ func (c *Client) ReadResponseOrInterleavedFrame() (interface{}, error) {
 			return nil, err
 		}
 
-		return payload, nil
+		return &RTPResponse{
+			ControlID: controlID,
+			Payload:   payload,
+		}, nil
 	}
 
 	return c.ReadResponse()
@@ -356,18 +404,18 @@ func (c *Client) Describe() (streams []*sdp.Media, err error) {
 	return c.medias, nil
 }
 
-func (c *Client) Options() error {
+func (c *Client) optionRequest() error {
 	req := Request{
 		Method:  MethodOption,
 		Uri:     c.URL,
 		Headers: textproto.MIMEHeader{},
 	}
 
-	//if c.session != "" {
-	//	req.Headers.Add("Session", c.session)
-	//}
+	return c.WriteRequest(req)
+}
 
-	if err := c.WriteRequest(req); err != nil {
+func (c *Client) Options() error {
+	if err := c.optionRequest(); err != nil {
 		return err
 	}
 
@@ -455,15 +503,9 @@ func (c *Client) OnOptionsReponse(resp *Response) error {
 }
 
 func (c *Client) OnDescribeResponse(resp *Response) error {
-	log.Info(resp.Headers)
-	log.Info(resp.ContentLength)
-	log.Info(resp.Body)
-
 	if resp.ContentLength == 0 || resp.StatusCode != 200 {
 		return fmt.Errorf("rtsp: Describe failed, StatusCode=%d", resp.StatusCode)
 	}
-
-	//c.session = resp.Headers.Get("Session")
 
 	_, medias, err := sdp.Parse(util.Bytes2String(resp.Body))
 	if err != nil {
@@ -476,7 +518,25 @@ func (c *Client) OnDescribeResponse(resp *Response) error {
 }
 
 func (c *Client) OnSetupResponse(resp *Response, control string) error {
-	s, err := NewSession(control, resp.Headers.Get("Transport"), resp.SessionID, false)
+	var mediaType av.MediaType = av.Fake
+	for _, media := range c.medias {
+		if media.Control == control {
+			mediaType = media.MediaType
+			break
+		}
+	}
+
+	builder := rtp.GetRTPCodecBuilder(mediaType)
+	if builder == nil {
+		return fmt.Errorf("invliad or unsupport mediatype")
+	}
+
+	codec, err := builder()
+	if err != nil {
+		return err
+	}
+
+	s, err := NewSession(control, resp.Headers.Get("Transport"), resp.SessionID, false, codec)
 	if err != nil {
 		return err
 	}
@@ -504,33 +564,128 @@ func (c *Client) handlerResponse(resp *Response, control string) error {
 	case MethodTeardown:
 		return nil
 	default:
-		log.Info(resp.Method)
 		return ErrUnsupportMethod
 	}
 }
 
-func (c *Client) Start() error {
-	go func() {
-		for {
-			select {
-			case <-c.ctx.Done():
+func (c *Client) startReadRoutine() {
+	c.currentControls = c.currentControls[:0]
+
+	c.sessionsLock.Lock()
+	for control := range c.sessions {
+		c.currentControls = append(c.currentControls, control)
+	}
+	c.sessionsLock.Unlock()
+
+	ticker := time.NewTimer(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			if err := c.optionRequest(); err != nil {
+				log.Error(err)
+				c.disConnectChan <- struct{}{}
 				return
-			default:
-				ret, err := c.ReadResponseOrInterleavedFrame()
-				if err != nil {
+			}
+		default:
+			ret, err := c.ReadResponseOrInterleavedFrame()
+			if err != nil {
+				log.Error(err)
+				c.disConnectChan <- struct{}{}
+				return
+			}
+
+			switch ret := ret.(type) {
+			case *Response:
+				if err := c.handlerResponse(ret, ""); err != nil {
 					log.Error(err)
+					c.disConnectChan <- struct{}{}
+					return
+				}
+			case *RTPResponse:
+				c.sessionsLock.Lock()
+				s := c.sessions[ret.ControlID]
+				c.sessionsLock.Unlock()
+
+				if c.OnAVPacket == nil {
+					continue
 				}
 
-				switch ret.(type) {
-				case *Response:
-					c.handlerResponse(ret.(*Response), "")
-				default:
-					p := ret.([]byte)
-					log.Info(p)
+				codec := s.GetRTPCodec()
+				if codec == nil {
+					continue
 				}
+
+				packet, err := codec.Decode(ret.Payload)
+				if err != nil {
+					log.Error(err)
+					continue
+				}
+
+				if err := c.OnAVPacket(packet); err != nil {
+					log.Error(err)
+					continue
+				}
+			default:
+				c.disConnectChan <- struct{}{}
 			}
 		}
-	}()
+	}
+}
+
+func (c *Client) reconnect() error {
+	connt, _, err := dial(c.Config)
+	if err != nil {
+		return err
+	}
+
+	c.conn = connt
+	c.brconn = bufio.NewReaderSize(connt, 4096)
+
+	if err := c.Options(); err != nil {
+		return err
+	}
+
+	if _, err := c.Describe(); err != nil {
+		return err
+	}
+
+	// close old sessions
+	for _, s := range c.sessions {
+		s.Stop()
+	}
+
+	if err := c.Setup(c.currentControls...); err != nil {
+		return err
+	}
+
+	return c.Play(nil)
+}
+
+func (c *Client) disConnectRoutine() {
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-c.disConnectChan:
+			for {
+				time.Sleep(5 * time.Second)
+				if err := c.reconnect(); err == nil {
+					break
+				}
+			}
+
+			go c.startReadRoutine()
+		}
+	}
+}
+
+func (c *Client) Start() error {
+	go c.disConnectRoutine()
+	go c.startReadRoutine()
 
 	for _, s := range c.sessions {
 		go s.Start()

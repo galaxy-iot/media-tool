@@ -297,7 +297,7 @@ func (c *RTSPClientConnection) requestHandler(req *Request) (*Response, bool, er
 		transport := req.Headers.Get("Transport")
 
 		trackID := getTrackID(c.Uri, req.Uri)
-		s, err := NewSession(trackID, transport, "", true)
+		s, err := NewSession(trackID, transport, "", true, nil)
 		if err != nil {
 			return nil, false, err
 		}

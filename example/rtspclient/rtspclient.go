@@ -4,15 +4,32 @@ import (
 	"sync"
 	"time"
 
+	"github.com/galaxy-iot/media-tool/av"
 	"github.com/galaxy-iot/media-tool/rtsp"
 	"github.com/wh8199/log"
+
+	"net/http"
+	_ "net/http/pprof"
+
+	_ "github.com/galaxy-iot/media-tool/rtp/h264"
 )
 
 func main() {
+	go func() {
+		http.ListenAndServe(":6060", nil)
+	}()
+
 	c, err := rtsp.DialTimeout(rtsp.Config{
-		URL:       "rtsp://192.168.123.197/myapp/screenlive",
+		URL:       "rtsp://172.21.84.105/myapp/screenlive",
 		Timeout:   10 * time.Second,
 		Transport: rtsp.TcpTransport,
+		OnAVPacket: func(avPacket *av.AVPacket) error {
+			if avPacket == nil {
+				return nil
+			}
+
+			return nil
+		},
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -32,7 +49,7 @@ func main() {
 		log.Info(media)
 	}
 
-	if err := c.Setup(medias[0]); err != nil {
+	if err := c.Setup(medias[0].Control); err != nil {
 		log.Fatal(err)
 	}
 

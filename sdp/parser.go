@@ -28,8 +28,9 @@ type SessionAttribute struct {
 }
 
 type Media struct {
-	AVType    string
-	Type      av.CodecType
+	AVType    av.AVType
+	MediaType av.MediaType
+
 	FPS       int
 	TimeScale int
 	Control   string
@@ -127,7 +128,13 @@ func Parse(content string) (sess *SessionAttribute, medias []*Media, err error) 
 
 			switch fields[0] {
 			case "audio", "video":
-				media = &Media{AVType: fields[0]}
+				media = &Media{}
+
+				if fields[0] == "audio" {
+					media.AVType = av.AVAudio
+				} else {
+					media.AVType = av.AVVideo
+				}
 
 				// 49170 RTP/AVP 0
 				mfields := strings.Split(fields[1], " ")
@@ -140,13 +147,13 @@ func Parse(content string) (sess *SessionAttribute, medias []*Media, err error) 
 
 				switch media.PayloadType {
 				case 0:
-					media.Type = av.PCM_MULAW
+					media.MediaType = av.PCMU
 				case 8:
-					media.Type = av.PCM_ALAW
+					media.MediaType = av.PCMA
 				case 96:
-					media.Type = av.H264
+					media.MediaType = av.H264
 				case 97:
-					media.Type = av.AAC
+					media.MediaType = av.AAC
 				default:
 					continue
 				}
@@ -183,33 +190,6 @@ func Parse(content string) (sess *SessionAttribute, medias []*Media, err error) 
 					// TODO
 					keyval = strings.Split(val, "/")
 					if len(keyval) >= 2 {
-						key := keyval[0]
-						switch strings.ToUpper(key) {
-						case "L16":
-							media.Type = av.PCM
-						case "OPUS", "MPEG4-GENERIC", "H264":
-							media.ChannelCount = 1
-							if i, err := strconv.Atoi(keyval[1]); err == nil {
-								media.SampleRate = i
-							}
-
-							if len(keyval) > 2 {
-								if i, err := strconv.Atoi(keyval[2]); err == nil {
-									media.ChannelCount = i
-								}
-							}
-						case "JPEG":
-							media.Type = av.JPEG
-						case "H265":
-							media.Type = av.H265
-						case "HEVC":
-							media.Type = av.H265
-						case "PCMA":
-							media.Type = av.PCM_ALAW
-						case "PCMU":
-							media.Type = av.PCM_MULAW
-						}
-
 						if i, err := strconv.Atoi(keyval[1]); err == nil {
 							media.TimeScale = i
 						}
@@ -227,7 +207,6 @@ func Parse(content string) (sess *SessionAttribute, medias []*Media, err error) 
 
 					if len(fields) > 1 {
 						keyval = strings.Split(fields[1], ";")
-
 						for _, field := range keyval {
 							keyval := strings.SplitN(field, "=", 2)
 							if len(keyval) == 2 {

@@ -9,12 +9,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/galaxy-iot/media-tool/rtp"
 	"github.com/galaxy-iot/media-tool/util"
-)
-
-const (
-	ModePlay   = "play"
-	ModeRecord = "record"
 )
 
 var (
@@ -23,7 +19,7 @@ var (
 	ErrInvalidServerPort      = errors.New("invalid server port")
 	ErrInvalidClientPort      = errors.New("invalid client port")
 
-	modeMap = map[string]string{
+	modeMap = map[string]Mode{
 		`"play"`:   ModePlay,
 		`"record"`: ModeRecord,
 	}
@@ -34,6 +30,8 @@ type Session interface {
 	Start() error
 	Stop()
 	GetSessionID() string
+	GetInterleavedPort() (int, int)
+	GetRTPCodec() rtp.RTPCodec
 }
 
 type session struct {
@@ -50,7 +48,7 @@ type session struct {
 	InterleavedControlPort int
 
 	// transport mode, play or record
-	Mode string
+	Mode Mode
 	// tcp,udp or multicast transport
 	Transport    Transport
 	SessionID    string
@@ -65,6 +63,8 @@ type session struct {
 
 	ctx      context.Context
 	cancFunc context.CancelFunc
+
+	rtpCodec rtp.RTPCodec
 }
 
 func (s *session) String() string {
@@ -89,9 +89,9 @@ func (s *session) String() string {
 			buf.WriteString(";")
 		}
 
-		if s.Mode != "" {
+		if s.Mode != 0 {
 			buf.WriteByte('"')
-			buf.WriteString(s.Mode)
+			buf.WriteString(s.Mode.String())
 			buf.WriteByte('"')
 			buf.WriteByte(';')
 		}
@@ -105,9 +105,9 @@ func (s *session) String() string {
 			buf.WriteString(strconv.Itoa(s.InterleavedControlPort))
 			buf.WriteString(";")
 		}
-		if s.Mode != "" {
+		if s.Mode != 0 {
 			buf.WriteByte('"')
-			buf.WriteString(s.Mode)
+			buf.WriteString(s.Mode.String())
 			buf.WriteByte('"')
 			buf.WriteByte(';')
 		}
@@ -135,11 +135,10 @@ func convertPortPair(portsStr string) (int, int, error) {
 	return dataPort, controlPort, nil
 }
 
-func NewSession(trackID, trans, sess string, isServer bool) (Session, error) {
+func NewSession(trackID, trans, sess string, isServer bool, codec rtp.RTPCodec) (Session, error) {
 	// RTP/AVP;unicast;client_port=4588-4589
 	// RTP/AVP;unicast;client_port=4588-4589;server_port=20000-20001;mode="play"
 	// RTP/AVP/TCP;interleaved=0-1
-
 	if sess == "" {
 		sess = fmt.Sprintf("%08X", util.Random32())
 	}
@@ -154,6 +153,7 @@ func NewSession(trackID, trans, sess string, isServer bool) (Session, error) {
 		ctx:          ctx,
 		cancFunc:     cancelFunc,
 		SessionID:    sess,
+		rtpCodec:     codec,
 	}
 
 	items := strings.Split(trans, ";")
@@ -212,6 +212,14 @@ func (s *session) GetSessionID() string {
 	return s.SessionID
 }
 
+func (s *session) GetRTPCodec() rtp.RTPCodec {
+	return s.rtpCodec
+}
+
+func (s *session) GetInterleavedPort() (int, int) {
+	return s.InterleavedDataPort, s.InterleavedControlPort
+}
+
 func newUDPClient(port int) (*net.UDPConn, error) {
 	p, err := net.ListenPacket("udp", ":"+strconv.Itoa(int(port)))
 	if err != nil {
@@ -219,7 +227,6 @@ func newUDPClient(port int) (*net.UDPConn, error) {
 	}
 
 	var listenPacket interface{} = p
-
 	c, ok := listenPacket.(*net.UDPConn)
 	if !ok {
 		return nil, fmt.Errorf("invalid listen packet")
@@ -327,4 +334,8 @@ func (s *session) Start() error {
 	}
 
 	return nil
+}
+
+func (s *session) HandlerPayload(bytes []byte) {
+
 }

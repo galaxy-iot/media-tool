@@ -7,8 +7,6 @@ import (
 	"github.com/wh8199/log"
 )
 
-const rtspBufferSize = 10000
-
 type Server struct {
 	rtspListen net.Listener
 	rtspPort   int
